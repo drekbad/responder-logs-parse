@@ -1,41 +1,36 @@
 #!/usr/bin/env python3
 """
-Summarize poisoned clients from Responder logs, by IP.
+Responder poisoned client summarizer.
 
-Default output (one line per client IP):
-  IP,HOSTNAME,PROTO1|PROTO2|...
+One row per poisoned client IP:
+  IP,LOG_NAME,RESOLVED_NAME,PROTOS
 
-HOSTNAME comes from --resolve mode:
-  - none  : leave blank
-  - rdns  : reverse DNS via socket.gethostbyaddr()
-  - infer : infer from names that client queried (e.g., collapse 'B3-5052ci-112' -> 'B3-5052ci'
-            ONLY if base also appears among that IP's names; ignore NBNS Local Master Browser noise)
-  - merge : rdns first; if empty, fallback to infer
+- LOG_NAME: chosen ONLY from what appears in the logs (never overwritten)
+- RESOLVED_NAME: optional reverse DNS (rDNS), separate column
+- PROTOS: e.g., LLMNR|NBT-NS|MDNS|WPAD
 
-Usage examples:
-  python3 poisoned_clients.py
-  python3 poisoned_clients.py --resolve rdns
-  python3 poisoned_clients.py --resolve merge -d /usr/share/responder/logs > poisoned.csv
+You can hint known domains and NetBIOS names:
+  --domain some-domain.local                (repeatable)
+  --netbios SOME-DOMAIN=some-domain.local  (repeatable)
+
+Examples:
+  python3 poisoned_clients_final.py
+  python3 poisoned_clients_final.py --resolve rdns --domain some-domain.local --netbios SOME-DOMAIN=some-domain.local --header
 """
 
 import argparse, os, re, ipaddress, socket
 from collections import defaultdict, Counter
-from typing import Optional, Iterable, Set
+from typing import Optional, Dict, Iterable, Tuple, Set
 
 DEFAULT_LOGDIR = "/usr/share/responder/logs"
 LOG_FILES = ("Analyzer-Session.log", "Poisoners-Session.log", "Responder-Session.log")
 
-# Match lines like:
-#   [*] [LLMNR] Poisoned answer sent to 172.16.1.5 for name B3-5052ci-112
-#   [*] [NBT-NS] Poisoned response sent to 172.16.1.2 for name SOME-DOMAIN (service: Local Master Browser)
 LINE_RX = re.compile(
     r"Poisoned\s+(?:answer|response)\s+sent\s+to\s+(?P<ip>\S+)"
     r".*?for\s+(?:name|workstation)\s+(?P<name>[A-Za-z0-9_.:-]+)"
     r"(?:\s*\(service:\s*(?P<service>[^)]+)\))?",
     re.IGNORECASE,
 )
-
-# Pull protocol tokens from the same line
 PROTO_RX = re.compile(r"\b(LLMNR|WPAD|MDNS|NBNS|NETBIOS-NS|NBT-NS)\b", re.IGNORECASE)
 
 def normalize_proto(tok: str) -> str:
@@ -45,8 +40,7 @@ def normalize_proto(tok: str) -> str:
     return "UNKNOWN"
 
 def clean_ip(ip_raw: str) -> str:
-    # strip IPv6 zone id (e.g., fe80::1%eth0)
-    return ip_raw.split("%", 1)[0]
+    return ip_raw.split("%", 1)[0]  # strip IPv6 zone id
 
 def ip_version(ip_s: str) -> Optional[int]:
     try:
@@ -54,56 +48,105 @@ def ip_version(ip_s: str) -> Optional[int]:
     except ValueError:
         return None
 
-# --- Heuristic inference of a hostname from names an IP queried ---
-SUFFIX_RX = re.compile(r"^(?P<base>[A-Za-z0-9_.:-]+?)-(?P<num>\d{1,5})$", re.ASCII)
+def is_single_label_mdns(name: str) -> bool:
+    # e.g., "host.local" (one dot, 'local' TLD), common Bonjour pattern
+    parts = name.split(".")
+    return len(parts) == 2 and parts[1].lower() == "local"
 
-def infer_hostname(cand_names: Iterable[str], noisy_services: Iterable[str]) -> str:
+def pick_log_name(
+    names: Counter,
+    services: Set[str],
+    protos: Set[str],
+    known_domains: Set[str],
+    known_netbios: Dict[str, str],
+) -> str:
     """
-    Try to pick a plausible hostname from names this client asked for.
-    Rules:
-      - ignore NBNS Local Master Browser noise
-      - detect suffix pattern '<base>-<digits>' but only collapse to <base> if <base> itself appears
-      - prefer the most frequent base/name
+    Choose a representative LOG_NAME from what the IP asked for in the logs.
+    Priority (highest first):
+      1) FQDN that ends with a known domain (e.g., host.some-domain.local)
+      2) Other multi-label FQDNs (not single-label mDNS 'host.local')
+      3) Shortname that ALSO has a corresponding FQDN variant among names
+      4) Plain shortname (no dots)
+      5) Single-label mDNS 'host.local'
+    Excludes obvious NBNS role noise and bare NetBIOS domain labels.
     """
-    names = []
-    lmb_noise = set(s for s in noisy_services if "local master browser" in s.lower())
-    # We only use 'service' to exclude obvious NBNS role noise; 'name' field itself is kept.
-    for n in cand_names:
-        if n.upper() in ("WPAD",):  # not a hostname
+    # Exclude NBNS role noise
+    if any("local master browser" in s.lower() for s in services):
+        # We can't remove specific events here, but we can avoid choosing the bare domain label.
+        pass
+
+    # Create working copy with counts
+    counts = Counter()
+    for n, c in names.items():
+        u = n.upper()
+        # Exclude literal WPAD and bare NetBIOS domain labels
+        if u == "WPAD":
             continue
-        names.append(n)
+        if u in known_netbios:  # e.g., "SOME-DOMAIN" alone isn't a hostname
+            continue
+        counts[n] += c
 
-    if not names:
+    if not counts:
         return ""
 
-    # Count occurrences
-    counts = Counter(names)
+    # Helper sets
+    lower_known_domains = {d.lower() for d in known_domains}
+    fqdn = []
+    fqdn_known = []
+    short = []
+    mdns_single = []
 
-    # Build set of bases that also appear as standalone names
-    bases_present: Set[str] = set()
+    # Build maps to detect shortname <-> fqdn relationships
+    # e.g., 'host' and 'host.some-domain.local'
+    short_to_fqdn = defaultdict(set)
     for n in counts:
-        m = SUFFIX_RX.match(n)
-        if m:
-            base = m.group("base")
-            if base in counts:
-                bases_present.add(base)
-
-    # Build a candidate score list (name or base)
-    scored = Counter()
-    for n, c in counts.items():
-        m = SUFFIX_RX.match(n)
-        if m:
-            base = m.group("base")
-            # Only collapse if the base also appears as its own name
-            if base in bases_present:
-                scored[base] += c
-            else:
-                scored[n] += c
+        if "." in n:
+            if any(n.lower().endswith("." + d) or n.lower() == d for d in lower_known_domains):
+                fqdn_known.append(n)
+            elif not is_single_label_mdns(n):
+                fqdn.append(n)
         else:
-            scored[n] += c
+            short.append(n)
 
-    # Pick the most common candidate (ties broken by shorter, then lexical)
-    best = sorted(scored.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0][0]
+    # map short -> fqdn (prefix match before first dot)
+    all_fqdns = fqdn_known + fqdn
+    for f in all_fqdns:
+        s = f.split(".", 1)[0]
+        short_to_fqdn[s].add(f)
+
+    # Build candidate lists by priority
+    candidates = []
+    if fqdn_known:
+        candidates.extend(("fqdn_known", n) for n in fqdn_known)
+    if fqdn:
+        candidates.extend(("fqdn_other", n) for n in fqdn)
+    # short names that have fqdn variants
+    for s in short:
+        if s in short_to_fqdn:
+            candidates.append(("short_with_fqdn", s))
+    # remaining short names
+    for s in short:
+        if s not in short_to_fqdn:
+            candidates.append(("short", s))
+    # finally, single-label mdns names (host.local)
+    for n in counts:
+        if is_single_label_mdns(n):
+            mdns_single.append(n)
+    candidates.extend(("mdns_single", n) for n in mdns_single)
+
+    # Score + pick best (by priority, then by descending count, then shorter, then lexicographic)
+    priority_rank = {
+        "fqdn_known": 0,
+        "fqdn_other": 1,
+        "short_with_fqdn": 2,
+        "short": 3,
+        "mdns_single": 4,
+    }
+    def score(item: Tuple[str, str]):
+        kind, n = item
+        return (priority_rank[kind], -counts[n], len(n), n.lower())
+
+    best = min(candidates, key=score)[1]
     return best
 
 def resolve_rdns(ip_s: str, timeout: float = 2.0) -> str:
@@ -114,22 +157,36 @@ def resolve_rdns(ip_s: str, timeout: float = 2.0) -> str:
     except Exception:
         return ""
 
+def parse_netbios_pairs(pairs: Iterable[str]) -> Dict[str, str]:
+    out = {}
+    for p in pairs:
+        if "=" in p:
+            left, right = p.split("=", 1)
+            if left and right:
+                out[left.strip().upper()] = right.strip().lower()
+    return out
+
 def main():
     ap = argparse.ArgumentParser(description="Summarize poisoned clients by IP from Responder logs.")
     ap.add_argument("-d", "--logdir", default=DEFAULT_LOGDIR, help="Logs directory.")
-    ap.add_argument("--resolve", choices=["none","rdns","infer","merge"], default="none",
-                    help="How to fill HOSTNAME column (default: none).")
+    ap.add_argument("--resolve", choices=["none","rdns"], default="none",
+                    help="Fill RESOLVED_NAME via rDNS (never overwrites LOG_NAME).")
+    ap.add_argument("--domain", action="append", default=[],
+                    help="Known AD DNS domain (repeatable), e.g. --domain some-domain.local")
+    ap.add_argument("--netbios", action="append", default=[],
+                    help="Map NetBIOS to DNS domain, e.g. --netbios SOME-DOMAIN=some-domain.local (repeatable)")
     ap.add_argument("--header", action="store_true", help="Print CSV header row.")
-    ap.add_argument("--suppress-mdns-local", action="store_true",
-                    help="Ignore mDNS names ending in .local during inference (does not affect protocol list).")
     args = ap.parse_args()
+
+    known_domains = set([d.strip().lower() for d in args.domain if d.strip()])
+    known_netbios = parse_netbios_pairs(args.netbios)
 
     # client_ip -> data
     clients = defaultdict(lambda: {
         "version": None,
         "protos": set(),
-        "names": set(),     # names this IP asked for (for optional inference)
-        "services": set(),  # NBNS service notes like Local Master Browser
+        "name_counts": Counter(),  # names seen from logs for this IP
+        "services": set(),
         "events": 0,
     })
 
@@ -147,40 +204,33 @@ def main():
                 name = (m.group("name") or "").rstrip(".,;:]")
                 service = (m.group("service") or "").strip()
 
-                found = {normalize_proto(p) for p in PROTO_RX.findall(line)}
-                if not found:
-                    found = {"UNKNOWN"}
+                protos = {normalize_proto(p) for p in PROTO_RX.findall(line)}
+                if not protos:
+                    protos = {"UNKNOWN"}
 
-                c = clients[ip_s]
-                c["version"] = c["version"] or ip_version(ip_s)
-                c["protos"].update(found)
-                c["events"] += 1
+                entry = clients[ip_s]
+                entry["version"] = entry["version"] or ip_version(ip_s)
+                entry["protos"].update(protos)
+                entry["events"] += 1
 
-                # Keep names for optional inference
-                if args.suppress_mdns_local and name.lower().endswith(".local"):
-                    pass
-                else:
-                    c["names"].add(name)
+                # Keep all raw names for this IP (we choose one later)
+                if name:
+                    entry["name_counts"][name] += 1
                 if service:
-                    c["services"].add(service)
+                    entry["services"].add(service)
 
-    # Output
     if args.header:
-        print("IP,HOSTNAME,PROTOS")
+        print("IP,LOG_NAME,RESOLVED_NAME,PROTOS")
 
+    # Emit one row per IP
     for ip_s in sorted(clients.keys(), key=lambda s: (ip_version(s) or 9, s)):
-        c = clients[ip_s]
-        protos = "|".join(sorted(p for p in c["protos"] if p != "UNKNOWN")) or "UNKNOWN"
-
-        hostname = ""
-        if args.resolve == "rdns":
-            hostname = resolve_rdns(ip_s)
-        elif args.resolve == "infer":
-            hostname = infer_hostname(c["names"], c["services"])
-        elif args.resolve == "merge":
-            hostname = resolve_rdns(ip_s) or infer_hostname(c["names"], c["services"])
-
-        print(f"{ip_s},{hostname},{protos}")
+        e = clients[ip_s]
+        log_name = pick_log_name(
+            e["name_counts"], e["services"], e["protos"], known_domains, known_netbios
+        )
+        resolved = resolve_rdns(ip_s) if args.resolve == "rdns" else ""
+        protos = "|".join(sorted(p for p in e["protos"] if p != "UNKNOWN")) or "UNKNOWN"
+        print(f"{ip_s},{log_name},{resolved},{protos}")
 
 if __name__ == "__main__":
     main()
