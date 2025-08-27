@@ -65,13 +65,6 @@ def parse_netbios_map(pairs: Iterable[str]) -> Dict[str, str]:
     return out
 
 def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str]) -> Tuple[Set[str], Dict[str,str], Set[str]]:
-    """
-    Accept:
-      --domain some-domain.local
-      --domain some-domain.local=SOME-DOMAIN
-      --netbios SOME-DOMAIN=some-domain.local
-      --netbios SOME-DOMAIN   (auto-map if exactly one domain is set)
-    """
     known_domains: Set[str] = set()
     known_netbios: Dict[str,str] = {}
 
@@ -109,16 +102,6 @@ def pick_log_name(
     known_netbios: Dict[str, str],
     banned_names: Set[str],
 ) -> Tuple[str, Set[str]]:
-    """
-    Choose LOG_NAME strictly from log-observed names for this IP.
-    Excludes: WPAD, banned names (exact), bare NetBIOS labels, and names that equal a known DNS domain.
-    Priority:
-      1) FQDN ending in a known domain
-      2) Other multi-label FQDNs (not 'host.local')
-      3) Shortname that ALSO has an FQDN variant among names
-      4) Plain shortname
-      5) Single-label mDNS 'host.local'
-    """
     flags = set()
     counts = Counter()
     lower_known_domains = {d.lower() for d in known_domains}
@@ -259,7 +242,6 @@ def resolve_nxc(ip_s: str, timeout: float = 4.0) -> str:
     return name or ""
 
 def forward_lookup_A(name: str, dns_servers: List[str]) -> List[str]:
-    """Return list of IPv4 A records for a hostname (best-effort)."""
     addrs: List[str] = []
     if not name:
         return addrs
@@ -380,7 +362,7 @@ def main():
                 if service:
                     e["services"].add(service)
 
-    # Build per-IP rows (store full set of observed names for later log-name merge)
+    # Build per-IP rows
     rows = []
     for ip_s in sorted(clients.keys(), key=ip_sort_key_str):
         e = clients[ip_s]
@@ -408,10 +390,10 @@ def main():
             "resolved": resolved,
             "protos": set(p for p in e["protos"] if p != "UNKNOWN") or {"UNKNOWN"},
             "flags": flags,
-            "names_all": set(e["name_counts"].keys()),  # <--- added
+            "names_all": set(e["name_counts"].keys()),
         })
 
-    # Merge IPv6 into IPv4 if asked
+    # Merge IPv6 into IPv4 if asked (UNION-FIND to avoid duplicates)
     if args.merge6:
         def valid_hostish(n: str) -> bool:
             if not n: return False
@@ -427,27 +409,27 @@ def main():
                 return r["log_name"].lower()
             return ""
 
-        # ---- 1) group by canonical name (resolved/log_name) ----
-        groups: Dict[str, List[int]] = defaultdict(list)
+        # ---- Build initial groups (lists of indices) ----
+        groups: List[Set[int]] = []
+
+        # 1) group by canonical name (resolved/log_name)
+        by_canon: Dict[str, Set[int]] = defaultdict(set)
         for i, r in enumerate(rows):
             cn = canon_name(r)
             if cn:
-                groups[cn].append(i)
+                by_canon[cn].add(i)
+        groups.extend(by_canon.values())
 
-        # ---- 2) v6 resolved -> forward A tie to v4 ----
+        # 2) v6 resolved -> forward A tie to v4
         ip_to_index = {r["ip"]: i for i, r in enumerate(rows)}
         for i, r in enumerate(rows):
             if r["v"] == 6 and valid_hostish(r["resolved"]):
-                a_ips = forward_lookup_A(r["resolved"], args.dns)
-                for a in a_ips:
+                for a in forward_lookup_A(r["resolved"], args.dns):
                     j = ip_to_index.get(a)
                     if j is not None:
-                        cn = r["resolved"].lower()
-                        groups[cn].append(i)
-                        groups[cn].append(j)
+                        groups.append({i, j})
 
-        # ---- 3) NEW: log-name merge (safe) ----
-        # Build name -> (v4 indices, v6 indices) map using names_all
+        # 3) log-name merge (safe, unambiguous)
         name_to_v4: Dict[str, List[int]] = defaultdict(list)
         name_to_v6: Dict[str, List[int]] = defaultdict(list)
 
@@ -456,60 +438,83 @@ def main():
             nl = n.lower()
             if nl in banned_names: return False
             if nl in known_domains: return False
-            return True  # allow .local etc., including GUID.local
+            return True  # allow .local etc.
 
         for i, r in enumerate(rows):
             for nm in r["names_all"]:
-                nl = nm.lower()
-                if not mergeable_logname(nl):
-                    continue
-                if r["v"] == 4:
-                    name_to_v4[nl].append(i)
-                elif r["v"] == 6:
-                    name_to_v6[nl].append(i)
+                if mergeable_logname(nm):
+                    if r["v"] == 4: name_to_v4[nm.lower()].append(i)
+                    elif r["v"] == 6: name_to_v6[nm.lower()].append(i)
 
         for nm in set(name_to_v4.keys()) & set(name_to_v6.keys()):
             v4_list = name_to_v4[nm]
             v6_list = name_to_v6[nm]
-            # Only merge when unambiguous: exactly one v4 row and one v6 row share this log name
             if len(v4_list) == 1 and len(v6_list) == 1:
                 i4, i6 = v4_list[0], v6_list[0]
                 r4, r6 = rows[i4], rows[i6]
-                # If both have resolved names and they disagree, skip
                 if r4["resolved"] and r6["resolved"] and r4["resolved"].lower() != r6["resolved"].lower():
                     continue
-                # Add both to a common group keyed by 'ln:<name>'
-                key = f"ln:{nm}"
-                groups[key].append(i4)
-                groups[key].append(i6)
-                # Mark both rows
-                r4["flags"].add("MERGED_BY_LOGNAME")
-                r6["flags"].add("MERGED_BY_LOGNAME")
+                rows[i4]["flags"].add("MERGED_BY_LOGNAME")
+                rows[i6]["flags"].add("MERGED_BY_LOGNAME")
+                groups.append({i4, i6})
 
-        # Dedup & build merged rows
-        for k in list(groups.keys()):
-            groups[k] = sorted(set(groups[k]))
+        # ---- Union-Find over indices to make disjoint components ----
+        parent = {i: i for i in range(len(rows))}
+        rank = {i: 0 for i in range(len(rows))}
 
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb: return
+            if rank[ra] < rank[rb]:
+                parent[ra] = rb
+            elif rank[ra] > rank[rb]:
+                parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+
+        for idxset in groups:
+            idxs = list(idxset)
+            for k in range(1, len(idxs)):
+                union(idxs[0], idxs[k])
+
+        components: Dict[int, Set[int]] = defaultdict(set)
+        for i in range(len(rows)):
+            components[find(i)].add(i)
+
+        # Build merged rows for components that actually have BOTH v4 and v6
         merged_rows = []
         consumed = set()
 
-        for cn, idxs in groups.items():
-            ipv4s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 4}, key=ipaddress.ip_address)
-            ipv6s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 6}, key=ipaddress.ip_address)
-            protos = set().union(*(rows[i]["protos"] for i in idxs))
-            flags = set().union(*(rows[i]["flags"] for i in idxs))
+        for comp_idxs in components.values():
+            v4s = sorted([i for i in comp_idxs if rows[i]["v"] == 4], key=lambda i: ipaddress.ip_address(rows[i]["ip"]))
+            v6s = sorted([i for i in comp_idxs if rows[i]["v"] == 6], key=lambda i: ipaddress.ip_address(rows[i]["ip"]))
+
+            if not v4s or not v6s:
+                # Not a true v4+v6 component; we'll print these as normal later.
+                continue
+
+            # Aggregate fields
+            ipv4_addrs = [rows[i]["ip"] for i in v4s]
+            ipv6_addrs = [rows[i]["ip"] for i in v6s]
+            protos = set().union(*(rows[i]["protos"] for i in comp_idxs))
+            flags = set().union(*(rows[i]["flags"] for i in comp_idxs))
             flags.add("MERGED_V4V6")
 
-            resolved_choices = [rows[i]["resolved"] for i in idxs if rows[i]["resolved"]]
+            # Picks
+            resolved_choices = [rows[i]["resolved"] for i in comp_idxs if rows[i]["resolved"]]
             resolved_pick = ""
-            for rv in resolved_choices:
-                if rv.lower() == cn.replace("ln:","",1):
-                    resolved_pick = rv
-                    break
-            if not resolved_pick and resolved_choices:
+            if resolved_choices:
+                # Prefer longest FQDN-ish, then lexicographic
                 resolved_pick = sorted(resolved_choices, key=lambda x: (-len(x), x.lower()))[0]
 
-            log_choices = [rows[i]["log_name"] for i in idxs if rows[i]["log_name"]]
+            log_choices = [rows[i]["log_name"] for i in comp_idxs if rows[i]["log_name"]]
             log_pick = ""
             if log_choices:
                 def log_score(n):
@@ -519,16 +524,16 @@ def main():
                 log_pick = sorted(log_choices, key=log_score)[0]
 
             merged_rows.append({
-                "ipv4": ";".join(ipv4s),
-                "ipv6": ";".join(ipv6s),
+                "ipv4": ";".join(ipv4_addrs),
+                "ipv6": ";".join(ipv6_addrs),
                 "log_name": log_pick,
                 "resolved": resolved_pick,
                 "protos": "|".join(sorted(protos)) if protos else "UNKNOWN",
                 "flags": "|".join(sorted(flags)) if flags else ""
             })
-            consumed.update(idxs)
+            consumed.update(comp_idxs)
 
-        # Add remaining rows that didn’t merge
+        # Add remaining rows not consumed by a v4+v6 component
         for i, r in enumerate(rows):
             if i in consumed:
                 continue
