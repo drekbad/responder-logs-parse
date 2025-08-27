@@ -3,8 +3,18 @@
 Responder poisoned client summarizer (domain-aware, multi-resolver) with:
 - Guided IPv6↔IPv4 merging (union-find)
 - Canon-name, log-name, DNS AAAA/A, synthesized FQDN, capture-name hints
-- Optional MAC neighbor linking, TLS cert fingerprint linking, SSH key linking
+- Optional MAC neighbor linking, TLS cert fingerprint linking (with SNI), SSH key linking
 - Quiet by default (DNS-only unless you include getent/nxc)
+
+Examples:
+  python3 poisoned_clients.py \
+    --resolve --resolve-chain rdns,dns \
+    --dns 10.10.10.10 --dns 10.10.10.11 \
+    --domain some-domain.local=SOMEDOMAIN \
+    --merge6 --mac-link \
+    --tls-link 443,8443,8080,8000,3389 --tls-sni \
+    --ssh-link \
+    --flags --why-merge --header
 """
 
 import argparse, os, re, ipaddress, socket, subprocess
@@ -38,7 +48,7 @@ def normalize_proto(tok: str) -> str:
     return "UNKNOWN"
 
 def clean_ip(ip_raw: str) -> str:
-    return ip_raw.split("%", 1)[0]
+    return ip_raw.split("%", 1)[0]  # strip IPv6 zone id
 
 def ip_version(ip_s: str) -> Optional[int]:
     try:
@@ -262,10 +272,12 @@ def _fmt_host_for_connect(ip_s: str) -> str:
 
 CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
 
-def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0) -> str:
+def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0, sni: str = "") -> str:
     host = _fmt_host_for_connect(ip_s)
-    out = run_cmd(["openssl", "s_client", "-connect", f"{host}:{port}", "-showcerts", "-verify", "0"],
-                  timeout=timeout, input_str="")  # empty stdin to close
+    cmd = ["openssl", "s_client", "-connect", f"{host}:{port}", "-showcerts", "-verify", "0"]
+    if sni:
+        cmd += ["-servername", sni]
+    out = run_cmd(cmd, timeout=timeout, input_str="")  # empty stdin to close
     if not out: return ""
     m = CERT_RE.search(out)
     if not m: return ""
@@ -277,11 +289,9 @@ def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0) -> s
     return parts[-1].replace(":", "").upper() if parts else ""
 
 def ssh_hostkey_fingerprint_sha256(ip_s: str, port: int = 22, timeout: float = 4.0) -> str:
-    # Get key via ssh-keyscan, then fingerprint via ssh-keygen -lf -E sha256
     scan = run_cmd(["ssh-keyscan", "-T", str(int(timeout)), "-p", str(port), ip_s], timeout=timeout+1)
     if not scan: return ""
     fpout = run_cmd(["ssh-keygen", "-lf", "-", "-E", "sha256"], timeout=2.0, input_str=scan)
-    # Example: 256 SHA256:abcdef... host (type)
     m = re.search(r"SHA256:([A-Za-z0-9+/=]+)", fpout or "")
     return (m.group(1) if m else "")
 
@@ -305,16 +315,17 @@ def main():
     ap.add_argument("--capture-names", dest="capture_names", action="store_true", default=True, help="Mine HostName/Workstation from capture logs (default on).")
     ap.add_argument("--no-capture-names", dest="capture_names", action="store_false")
     ap.add_argument("--mac-link", action="store_true", help="Merge IPv4/IPv6 by MAC from neighbor tables (quiet).")
-    ap.add_argument("--synth", dest="synth", action="store_true", help="Use short+domain synthesized FQDN for extra A/AAAA lookups.")
+    ap.add_argument("--synth", dest="synth", action="store_true", default=None, help="Use short+domain synthesized FQDN for extra A/AAAA lookups.")
     ap.add_argument("--no-synth", dest="synth", action="store_false")
     # NEW active linkers
-    ap.add_argument("--tls-link", default="", help="Comma-separated ports (e.g., 443,8443) to link by TLS cert SHA-256 fingerprint.")
+    ap.add_argument("--tls-link", default="", help="Comma-separated ports (e.g., 443,8443,3389) to link by TLS cert SHA-256 fingerprint.")
+    ap.add_argument("--tls-sni", action="store_true", help="Send SNI (resolved/log FQDN or synthesized) during TLS linking.")
     ap.add_argument("--ssh-link", action="store_true", help="Link by SSH host key (SHA-256).")
     # merge
     ap.add_argument("--merge6", "--merge-v4v6", dest="merge6", action="store_true",
                     help="Merge IPv6 rows into IPv4 rows when correlated by name/DNS/MAC/cert/ssh.")
-    ap.add_argument("--flags", action="store_true", help="Include a FLAGS column.")
-    ap.add_argument("--why-merge", action="store_true", help="Annotate merge reasons in FLAGS.")
+    ap.add_argument("--flags", action="store_true", help="Include a FLAGS column (needed to view --why-merge tags).")
+    ap.add_argument("--why-merge", action="store_true", help="Annotate merge reasons inside FLAGS.")
     args = ap.parse_args()
 
     known_domains, known_netbios, _ = parse_domains_and_netbios(args.domain, args.netbios)
@@ -433,7 +444,6 @@ def main():
         log_name, pick_flags = pick_log_name(e["name_counts"], e["services"], e["protos"],
                                              known_domains, known_netbios, banned_names)
         flags |= pick_flags
-        # resolution
         resolved = ""
         if chain:
             for step in chain:
@@ -442,7 +452,6 @@ def main():
                 elif step == "getent": resolved = resolve_getent(ip_s)
                 elif step == "nxc":  resolved = resolve_nxc(ip_s, timeout=args.nxc_timeout)
                 if resolved: break
-
         if log_name and log_name.lower() in known_domains:
             log_name = ""; flags.add("BLANKED_DOMAIN_LOGNAME")
         if resolved and "." in resolved and log_name:
@@ -451,7 +460,6 @@ def main():
                 log_name.upper() in known_netbios and known_netbios[log_name.upper()].lower() == resolved_domain
             ):
                 log_name = ""; flags.add("BLANKED_DOMAIN_LOGNAME_BY_RESOLVED")
-
         rows.append({
             "ip": ip_s,
             "v": e["version"],
@@ -537,7 +545,7 @@ def main():
                         if rv6["v"] == 6 and mac_by_ip6.get(rv6["ip"]) == mac:
                             edges.append((i, j, "MAC"))
 
-        # 3) TLS cert fingerprint linking (active, optional)
+        # 3) TLS cert fingerprint linking (active, optional) with optional SNI
         tls_ports: List[int] = []
         if args.tls_link:
             for p in args.tls_link.split(","):
@@ -546,9 +554,30 @@ def main():
         if tls_ports:
             fp_map_v4: Dict[Tuple[int,str], List[int]] = defaultdict(list)
             fp_map_v6: Dict[Tuple[int,str], List[int]] = defaultdict(list)
+
+            # Helper to choose an SNI (FQDN if available; else synth from short+domain)
+            def pick_sni(row: dict) -> str:
+                if not args.tls_sni:
+                    return ""
+                # prefer resolved/log FQDN
+                if row.get("resolved") and "." in row["resolved"]:
+                    return row["resolved"]
+                if row.get("log_name") and "." in row["log_name"]:
+                    return row["log_name"]
+                # synthesize from short + any known domain
+                fqdn, short, dom = best_name_pair(row)
+                if fqdn:
+                    return fqdn
+                if short and known_domains:
+                    # deterministic pick of a domain
+                    d = sorted(known_domains)[0]
+                    return f"{short}.{d}"
+                return ""
+
             for i, r in enumerate(rows):
                 for port in tls_ports:
-                    fp = tls_cert_fingerprint_sha256(r["ip"], port, timeout=4.0)
+                    sni = pick_sni(r)
+                    fp = tls_cert_fingerprint_sha256(r["ip"], port, timeout=4.0, sni=sni)
                     if not fp: continue
                     key = (port, fp)
                     if r["v"] == 4: fp_map_v4[key].append(i)
@@ -575,7 +604,7 @@ def main():
         # Union initial edges
         for a,b,reason in edges:
             union(a,b)
-            if args.why_merge:
+            if args.why-merge:
                 rows[a]["flags"].add("MERGED_BY_"+reason)
                 rows[b]["flags"].add("MERGED_BY_"+reason)
 
@@ -609,7 +638,7 @@ def main():
                         j = index_by_ip.get(v6)
                         if j is not None and rows[j]["v"] == 6:
                             union(v4_idxs[0], j)
-                            if args.why_merge:
+                            if args.why-merge:
                                 rows[v4_idxs[0]]["flags"].add("MERGED_BY_AAAA")
                                 rows[j]["flags"].add("MERGED_BY_AAAA")
                                 if nm not in (rows[v4_idxs[0]]["resolved"], rows[v4_idxs[0]]["log_name"]):
@@ -639,7 +668,7 @@ def main():
                         j = index_by_ip.get(v4)
                         if j is not None and rows[j]["v"] == 4:
                             union(v6_idxs[0], j)
-                            if args.why_merge:
+                            if args.why-merge:
                                 rows[v6_idxs[0]]["flags"].add("MERGED_BY_A")
                                 rows[j]["flags"].add("MERGED_BY_A")
                                 if nm not in (rows[v6_idxs[0]]["resolved"], rows[v6_idxs[0]]["log_name"]):
@@ -692,7 +721,7 @@ def main():
                     any_v6 = next(iter(v6_idxs))
                     rep_v4 = next(iter([i for i in comps[target] if rows[i]["v"] == 4]))
                     union(any_v6, rep_v4)
-                    if args.why_merge:
+                    if args.why-merge:
                         rows[any_v6]["flags"].add("MERGED_BY_FQDN" if cand_fqdns else "MERGED_BY_SHORT")
 
         # Build final components and output
@@ -773,7 +802,6 @@ def main():
         return
 
     # Non-merged output (no --merge6)
-    # (We still de-number single rows for nicer presentation)
     plain_bases = {n for n in all_names_seen if not NUM_SUFFIX_RX.match(n)}
     def denumber(name: str) -> str:
         if not name: return name
