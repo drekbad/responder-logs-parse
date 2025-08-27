@@ -2,29 +2,12 @@
 """
 Responder poisoned client summarizer (domain-aware, multi-resolver) with:
 - Guided IPv6↔IPv4 merging (union-find)
-- Log-name, DNS AAAA/A, synthesized FQDN, capture-name hints, and MAC neighbor linking
+- Canon-name, log-name, DNS AAAA/A, synthesized FQDN, capture-name hints
+- Optional MAC neighbor linking, TLS cert fingerprint linking, SSH key linking
 - Quiet by default (DNS-only unless you include getent/nxc)
-
-Output (default):
-  IP,LOG_NAME,RESOLVED_NAME,PROTOS[,FLAGS]
-Or with --merge6:
-  IPv4;IPv4...,IPv6;IPv6...,LOG_NAME,RESOLVED_NAME,PROTOS[,FLAGS]
-
-Useful flags:
-  --resolve --resolve-chain rdns,dns[,getent,nxc] --dns <dc> --dns <dc2>
-  --merge6
-  --domain some-domain.local[=SOMEDOMAIN]   (repeatable)
-  --netbios SOMEDOMAIN[=some-domain.local]  (repeatable)
-  --ban-name NAME                           (repeatable; exact match)
-  --no-ban-defaults                         (don’t auto-ban wpad.local / https.local)
-  --capture-names / --no-capture-names      (default: on)
-  --mac-link                                 (use ARP/NDP to merge by MAC)
-  --synth / --no-synth                       (default: on if any --domain given)
-  --why-merge                                (explain merge reasons in FLAGS)
-  --flags                                    (include FLAGS column)
 """
 
-import argparse, os, re, ipaddress, socket, subprocess, sys
+import argparse, os, re, ipaddress, socket, subprocess
 from collections import defaultdict, Counter
 from typing import Optional, Dict, Iterable, Tuple, Set, List
 
@@ -45,6 +28,7 @@ ALT_CLIENT_RX = re.compile(r"(?i)Hash\s+captured\s+from\s+(?P<ip>\S+)")
 NAME_HINT_RX = re.compile(r"(?i)\b(?:HostName|Hostname|Workstation|Machine|Computer(?:Name)?)\s*[:=]\s*([A-Za-z0-9_.-]+)")
 
 DEFAULT_BANNED = {"wpad.local", "https.local"}  # exact (case-insensitive)
+NUM_SUFFIX_RX = re.compile(r"^([A-Za-z0-9_-]+)-(\d+)$")  # dash + digits only
 
 # ---------- helpers ----------
 def normalize_proto(tok: str) -> str:
@@ -54,7 +38,7 @@ def normalize_proto(tok: str) -> str:
     return "UNKNOWN"
 
 def clean_ip(ip_raw: str) -> str:
-    return ip_raw.split("%", 1)[0]  # strip IPv6 zone id
+    return ip_raw.split("%", 1)[0]
 
 def ip_version(ip_s: str) -> Optional[int]:
     try:
@@ -85,24 +69,17 @@ def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str])
             dns, nb = d.split("=", 1)
             dns = dns.strip().lower()
             nb  = nb.strip().upper()
-            if dns:
-                known_domains.add(dns)
-            if dns and nb:
-                known_netbios[nb] = dns
+            if dns: known_domains.add(dns)
+            if dns and nb: known_netbios[nb] = dns
         else:
             dns = d.strip().lower()
-            if dns:
-                known_domains.add(dns)
-
+            if dns: known_domains.add(dns)
     explicit_map = parse_netbios_map([n for n in netbios_flags if "=" in n])
     known_netbios.update(explicit_map)
     bare_nb = {n.strip().upper() for n in netbios_flags if "=" not in n and n.strip()}
-
     if bare_nb and len(known_domains) == 1:
         only_dom = next(iter(known_domains))
-        for nb in bare_nb:
-            known_netbios[nb] = only_dom
-
+        for nb in bare_nb: known_netbios[nb] = only_dom
     return known_domains, known_netbios, bare_nb
 
 def ip_sort_key_str(ip_str: str):
@@ -115,16 +92,15 @@ def ip_sort_key_str(ip_str: str):
 def merged_row_sort_key(row: dict):
     v4s = [ipaddress.ip_address(x) for x in row["ipv4"].split(";") if x]
     v6s = [ipaddress.ip_address(x) for x in row["ipv6"].split(";") if x]
-    if v4s:
-        return (0, min(v4s))
-    if v6s:
-        return (1, min(v6s))
+    if v4s: return (0, min(v4s))
+    if v6s: return (1, min(v6s))
     return (2, row.get("resolved","") or row.get("log_name",""))
 
-# ---------- resolvers ----------
-def run_cmd(cmd: List[str], timeout: float = 2.5) -> str:
+# ---------- resolvers / runners ----------
+def run_cmd(cmd: List[str], timeout: float = 2.5, input_str: Optional[str] = None) -> str:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, input=(input_str.encode() if input_str is not None else None),
+                           capture_output=True, text=True, timeout=timeout)
         if r.returncode == 0:
             return (r.stdout or "").strip()
         return ""
@@ -151,11 +127,9 @@ def resolve_dns_tools(ip_s: str, dns_servers: List[str]) -> str:
         cmds.append(["host", "-W", "1", ip_s])
     for c in cmds:
         out = run_cmd(c)
-        if not out:
-            continue
+        if not out: continue
         line = out.splitlines()[0].strip()
-        if not line:
-            continue
+        if not line: continue
         if "pointer" in line:
             return line.split()[-1].rstrip(".")
         if "." in line:
@@ -166,16 +140,14 @@ def resolve_getent(ip_s: str) -> str:
     out = run_cmd(["getent", "hosts", ip_s])
     if out:
         parts = out.split()
-        if len(parts) >= 2:
-            return parts[1].rstrip(".")
+        if len(parts) >= 2: return parts[1].rstrip(".")
     return ""
 
 def tcp_port_open(ip_s: str, port: int, timeout: float = 0.6) -> bool:
     try:
         fam = socket.AF_INET6 if ip_version(ip_s) == 6 else socket.AF_INET
         with socket.socket(fam, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect((ip_s, port))
+            s.settimeout(timeout); s.connect((ip_s, port))
         return True
     except Exception:
         return False
@@ -184,16 +156,12 @@ NXC_NAME_RX = re.compile(r"\(name:([A-Za-z0-9_.-]+)\)")
 NXC_DOM_RX  = re.compile(r"\(domain:([A-Za-z0-9_.-]+)\)")
 
 def resolve_nxc(ip_s: str, timeout: float = 4.0) -> str:
-    if not tcp_port_open(ip_s, 445, timeout=min(0.8, timeout)):
-        return ""
+    if not tcp_port_open(ip_s, 445, timeout=min(0.8, timeout)): return ""
     out = run_cmd(["nxc", "smb", ip_s, "--timeout", str(int(max(1, timeout)))], timeout=timeout+1.0)
-    if not out:
-        return ""
-    name = ""
-    dom = ""
-    m = NXC_NAME_RX.search(out)
+    if not out: return ""
+    name = ""; dom = ""
+    m = NXC_NAME_RX.search(out);  m2 = NXC_DOM_RX.search(out)
     if m: name = m.group(1)
-    m2 = NXC_DOM_RX.search(out)
     if m2: dom = m2.group(1)
     if name and dom and "." in dom and "." not in name:
         return f"{name}.{dom}".rstrip(".")
@@ -201,8 +169,7 @@ def resolve_nxc(ip_s: str, timeout: float = 4.0) -> str:
 
 def forward_lookup_A(name: str, dns_servers: List[str]) -> List[str]:
     addrs: List[str] = []
-    if not name:
-        return addrs
+    if not name: return addrs
     cmds = []
     if dns_servers:
         for s in dns_servers:
@@ -214,56 +181,48 @@ def forward_lookup_A(name: str, dns_servers: List[str]) -> List[str]:
         cmds.append(["getent", "hosts", name])
     for c in cmds:
         out = run_cmd(c)
-        if not out:
-            continue
+        if not out: continue
         for line in out.splitlines():
             for t in line.strip().split():
-                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t):
-                    addrs.append(t)
+                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t): addrs.append(t)
     return sorted(set(addrs))
 
 def forward_lookup_AAAA(name: str, dns_servers: List[str]) -> List[str]:
     addrs: List[str] = []
-    if not name:
-        return addrs
+    if not name: return addrs
     cmds = []
     if dns_servers:
         for s in dns_servers:
             cmds.append(["dig", "+short", name, "AAAA", "@"+s, "+time=1", "+tries=1"])
         for s in dns_servers:
-            cmds.append(["getent", "ahosts", name])  # returns v4/v6; we'll filter
+            cmds.append(["getent", "ahosts", name])
     else:
         cmds.append(["dig", "+short", name, "AAAA", "+time=1", "+tries=1"])
         cmds.append(["getent", "ahosts", name])
     for c in cmds:
         out = run_cmd(c)
-        if not out:
-            continue
+        if not out: continue
         for line in out.splitlines():
             for tok in line.strip().split():
                 try:
                     ip = ipaddress.ip_address(tok)
-                    if ip.version == 6:
-                        addrs.append(str(ip))
+                    if ip.version == 6: addrs.append(str(ip))
                 except ValueError:
                     continue
     return sorted(set(addrs))
 
 # ---------- tiny name helpers ----------
 def split_host_domain(name: str) -> Tuple[str, str]:
-    if not name:
-        return ("","")
+    if not name: return ("","")
     n = name.strip(".")
     parts = n.split(".")
-    if len(parts) < 2:
-        return (n.lower(), "")
+    if len(parts) < 2: return (n.lower(), "")
     return (parts[0].lower(), ".".join(parts[1:]).lower())
 
 def best_name_pair(row: dict) -> Tuple[str, str, str]:
     cand = row.get("resolved") or row.get("log_name") or ""
     short, dom = split_host_domain(cand)
-    if "." in cand:
-        return (cand.lower(), short, dom)
+    if "." in cand: return (cand.lower(), short, dom)
     return ("", short, dom)
 
 # ---------- neighbor tables (quiet) ----------
@@ -286,7 +245,6 @@ def load_ndp_ipv6() -> Dict[str, str]:
     macs = {}
     out = run_cmd(["ip", "-6", "neigh", "show"], timeout=2.0)
     for line in (out or "").splitlines():
-        # fe80::1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
         m = re.search(r"^(\S+).*\blladdr\s+([0-9a-f:]{17})\b", line, re.I)
         if m:
             ip, mac = m.group(1), m.group(2).lower()
@@ -296,6 +254,36 @@ def load_ndp_ipv6() -> Dict[str, str]:
             except ValueError:
                 continue
     return macs
+
+# ---------- active linkers ----------
+def _fmt_host_for_connect(ip_s: str) -> str:
+    # openssl -connect needs [v6]:port for IPv6
+    return f"[{ip_s}]" if ":" in ip_s else ip_s
+
+CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0) -> str:
+    host = _fmt_host_for_connect(ip_s)
+    out = run_cmd(["openssl", "s_client", "-connect", f"{host}:{port}", "-showcerts", "-verify", "0"],
+                  timeout=timeout, input_str="")  # empty stdin to close
+    if not out: return ""
+    m = CERT_RE.search(out)
+    if not m: return ""
+    pem = m.group(0)
+    fp = run_cmd(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], timeout=2.0, input_str=pem)
+    if not fp: return ""
+    # Format: SHA256 Fingerprint=AA:BB:...
+    parts = fp.strip().split("=")
+    return parts[-1].replace(":", "").upper() if parts else ""
+
+def ssh_hostkey_fingerprint_sha256(ip_s: str, port: int = 22, timeout: float = 4.0) -> str:
+    # Get key via ssh-keyscan, then fingerprint via ssh-keygen -lf -E sha256
+    scan = run_cmd(["ssh-keyscan", "-T", str(int(timeout)), "-p", str(port), ip_s], timeout=timeout+1)
+    if not scan: return ""
+    fpout = run_cmd(["ssh-keygen", "-lf", "-", "-E", "sha256"], timeout=2.0, input_str=scan)
+    # Example: 256 SHA256:abcdef... host (type)
+    m = re.search(r"SHA256:([A-Za-z0-9+/=]+)", fpout or "")
+    return (m.group(1) if m else "")
 
 # ---------- main ----------
 def main():
@@ -319,16 +307,19 @@ def main():
     ap.add_argument("--mac-link", action="store_true", help="Merge IPv4/IPv6 by MAC from neighbor tables (quiet).")
     ap.add_argument("--synth", dest="synth", action="store_true", help="Use short+domain synthesized FQDN for extra A/AAAA lookups.")
     ap.add_argument("--no-synth", dest="synth", action="store_false")
+    # NEW active linkers
+    ap.add_argument("--tls-link", default="", help="Comma-separated ports (e.g., 443,8443) to link by TLS cert SHA-256 fingerprint.")
+    ap.add_argument("--ssh-link", action="store_true", help="Link by SSH host key (SHA-256).")
     # merge
     ap.add_argument("--merge6", "--merge-v4v6", dest="merge6", action="store_true",
-                    help="Merge IPv6 rows into IPv4 rows when correlated by name/DNS/MAC.")
+                    help="Merge IPv6 rows into IPv4 rows when correlated by name/DNS/MAC/cert/ssh.")
     ap.add_argument("--flags", action="store_true", help="Include a FLAGS column.")
     ap.add_argument("--why-merge", action="store_true", help="Annotate merge reasons in FLAGS.")
     args = ap.parse_args()
 
     known_domains, known_netbios, _ = parse_domains_and_netbios(args.domain, args.netbios)
     if args.synth is None:
-        args.synth = bool(known_domains)  # enable synth if domains were provided
+        args.synth = bool(known_domains)
     banned_names = set(n.strip() for n in args.ban_name if n.strip())
     if not args.no_ban_defaults:
         banned_names |= DEFAULT_BANNED
@@ -338,7 +329,7 @@ def main():
     if args.resolve and args.resolve_chain == "rdns":
         chain = ["rdns", "dns", "getent", "nxc"]
 
-    # Collect raw per-IP rows
+    # Collect raw per-IP rows + gather all names to help de-numbering
     clients = defaultdict(lambda: {
         "version": None,
         "protos": set(),
@@ -346,53 +337,50 @@ def main():
         "services": set(),
         "events": 0,
     })
+    all_names_seen: Set[str] = set()
 
     # Parse poisoned lines
     for fname in LOG_FILES:
         path = os.path.join(args.logdir, fname)
-        if not os.path.isfile(path):
-            continue
+        if not os.path.isfile(path): continue
         with open(path, "r", errors="ignore") as fh:
             for line in fh:
                 m = LINE_RX.search(line)
-                if not m:
-                    continue
+                if not m: continue
                 ip_s = clean_ip(m.group("ip"))
                 name = (m.group("name") or "").rstrip(".,;:]")
                 service = (m.group("service") or "").strip()
                 protos = {normalize_proto(p) for p in PROTO_RX.findall(line)} or {"UNKNOWN"}
-
                 e = clients[ip_s]
                 e["version"] = e["version"] or ip_version(ip_s)
                 e["protos"].update(protos)
                 e["events"] += 1
                 if name:
                     e["name_counts"][name] += 1
+                    all_names_seen.add(name)
                 if service:
                     e["services"].add(service)
 
-    # OPTIONAL: harvest capture names from Responder-Session.log
-    if args.capture_names:
-        path = os.path.join(args.logdir, "Responder-Session.log")
-        if os.path.isfile(path):
-            last_ip = ""
-            with open(path, "r", errors="ignore") as fh:
-                for line in fh:
-                    m = CLIENT_RX.search(line) or ALT_CLIENT_RX.search(line)
-                    if m:
-                        last_ip = clean_ip(m.group("ip"))
-                        continue
-                    if last_ip:
-                        nm = NAME_HINT_RX.search(line)
-                        if nm:
-                            name = nm.group(1).rstrip(".,;:]")
-                            if name:
-                                e = clients[last_ip]
-                                e["version"] = e["version"] or ip_version(last_ip)
-                                e["name_counts"][name] += 1
+    # OPTIONAL: harvest capture names
+    path = os.path.join(args.logdir, "Responder-Session.log")
+    if args.capture_names and os.path.isfile(path):
+        last_ip = ""
+        with open(path, "r", errors="ignore") as fh:
+            for line in fh:
+                m = CLIENT_RX.search(line) or ALT_CLIENT_RX.search(line)
+                if m:
+                    last_ip = clean_ip(m.group("ip")); continue
+                if last_ip:
+                    nm = NAME_HINT_RX.search(line)
+                    if nm:
+                        name = nm.group(1).rstrip(".,;:]")
+                        if name:
+                            e = clients[last_ip]
+                            e["version"] = e["version"] or ip_version(last_ip)
+                            e["name_counts"][name] += 1
+                            all_names_seen.add(name)
 
     # Build per-IP rows
-    rows = []
     def pick_log_name(names: Counter, services: Set[str], protos: Set[str],
                       known_domains: Set[str], known_netbios: Dict[str, str],
                       banned_names: Set[str]) -> Tuple[str, Set[str]]:
@@ -400,25 +388,18 @@ def main():
         counts = Counter()
         lower_known_domains = {d.lower() for d in known_domains}
         banned_lower = {b.lower() for b in banned_names}
-
         for n, c in names.items():
             u = n.upper(); nlow = n.lower()
-            if u == "WPAD":
-                continue
+            if u == "WPAD": continue
             if nlow in banned_lower:
                 flags.add("BANNED_LOGNAME_SEEN"); continue
-            if u in known_netbios:
-                continue
+            if u in known_netbios: continue
             if nlow in lower_known_domains:
                 flags.add("DOMAIN_ONLY_NAME_SEEN"); continue
             counts[n] += c
-
-        if not counts:
-            return ("", flags)
-
+        if not counts: return ("", flags)
         fqdn_known, fqdn_other, short, mdns_single = [], [], [], []
         short_to_fqdn = defaultdict(set)
-
         for n in counts:
             nlow = n.lower()
             if "." in n:
@@ -428,34 +409,27 @@ def main():
                     fqdn_other.append(n)
             else:
                 short.append(n)
-
         for f in fqdn_known + fqdn_other:
             s = f.split(".", 1)[0]; short_to_fqdn[s].add(f)
-
         candidates = []
         candidates.extend(("fqdn_known", n) for n in fqdn_known)
         candidates.extend(("fqdn_other", n) for n in fqdn_other)
         for s in short:
-            if s in short_to_fqdn:
-                candidates.append(("short_with_fqdn", s))
+            if s in short_to_fqdn: candidates.append(("short_with_fqdn", s))
         for s in short:
-            if s not in short_to_fqdn:
-                candidates.append(("short", s))
+            if s not in short_to_fqdn: candidates.append(("short", s))
         for n in counts:
-            if is_single_label_mdns(n):
-                mdns_single.append(n)
+            if is_single_label_mdns(n): mdns_single.append(n)
         candidates.extend(("mdns_single", n) for n in mdns_single)
-
         priority_rank = {"fqdn_known":0,"fqdn_other":1,"short_with_fqdn":2,"short":3,"mdns_single":4}
         def score(item: Tuple[str,str]):
             kind, n = item
             return (priority_rank[kind], -counts[n], len(n), n.lower())
-
         return (min(candidates, key=score)[1], flags)
 
+    rows = []
     for ip_s in sorted(clients.keys(), key=ip_sort_key_str):
-        e = clients[ip_s]
-        flags = set()
+        e = clients[ip_s]; flags = set()
         log_name, pick_flags = pick_log_name(e["name_counts"], e["services"], e["protos"],
                                              known_domains, known_netbios, banned_names)
         flags |= pick_flags
@@ -463,16 +437,11 @@ def main():
         resolved = ""
         if chain:
             for step in chain:
-                if step == "rdns":
-                    resolved = resolve_rdns(ip_s)
-                elif step == "dns":
-                    resolved = resolve_dns_tools(ip_s, args.dns)
-                elif step == "getent":
-                    resolved = resolve_getent(ip_s)
-                elif step == "nxc":
-                    resolved = resolve_nxc(ip_s, timeout=args.nxc_timeout)
-                if resolved:
-                    break
+                if step == "rdns":   resolved = resolve_rdns(ip_s)
+                elif step == "dns":  resolved = resolve_dns_tools(ip_s, args.dns)
+                elif step == "getent": resolved = resolve_getent(ip_s)
+                elif step == "nxc":  resolved = resolve_nxc(ip_s, timeout=args.nxc_timeout)
+                if resolved: break
 
         if log_name and log_name.lower() in known_domains:
             log_name = ""; flags.add("BLANKED_DOMAIN_LOGNAME")
@@ -497,52 +466,45 @@ def main():
     mac_by_ip4 = load_arp_ipv4() if args.mac_link else {}
     mac_by_ip6 = load_ndp_ipv6() if args.mac_link else {}
 
-    # Merge IPv6 into IPv4 if asked (UNION-FIND + multi-phase)
+    # Merge IPv6 into IPv4 if asked
     if args.merge6:
         def valid_hostish(n: str) -> bool:
             if not n: return False
             nl = n.lower()
-            if nl in banned_names: return False
-            if nl in known_domains: return False
+            if nl in banned_names or nl in known_domains: return False
             return True
-
         def canon_name(r: dict) -> str:
-            if valid_hostish(r["resolved"]):
-                return r["resolved"].lower()
-            if valid_hostish(r["log_name"]):
-                return r["log_name"].lower()
+            if valid_hostish(r["resolved"]): return r["resolved"].lower()
+            if valid_hostish(r["log_name"]): return r["log_name"].lower()
             return ""
 
-        # Union-Find setup
+        # Union-Find
         parent = {i: i for i in range(len(rows))}
         rank = {i: 0 for i in range(len(rows))}
         def find(x):
             while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
+                parent[x] = parent[parent[x]]; x = parent[x]
             return x
-        def union(a, b):
+        def union(a,b):
             ra, rb = find(a), find(b)
             if ra == rb: return
             if rank[ra] < rank[rb]: parent[ra] = rb
             elif rank[ra] > rank[rb]: parent[rb] = ra
             else: parent[rb] = ra; rank[ra] += 1
 
-        # Relation builders (collect edges then union)
-        edges = []    # list of (i,j,reason)
+        edges = []  # (i,j,reason)
         index_by_ip = {r["ip"]: i for i, r in enumerate(rows)}
 
-        # 0) group by canonical name (resolved/log_name)
+        # 0) group by canonical name
         by_canon: Dict[str, List[int]] = defaultdict(list)
         for i, r in enumerate(rows):
             cn = canon_name(r)
-            if cn:
-                by_canon[cn].append(i)
+            if cn: by_canon[cn].append(i)
         for cn, idxs in by_canon.items():
             for k in range(1, len(idxs)):
                 edges.append((idxs[0], idxs[k], "CANON_NAME"))
 
-        # 1) Unambiguous log-name v4<->v6 link
+        # 1) unambiguous log-name v4<->v6
         name_to_v4: Dict[str, List[int]] = defaultdict(list)
         name_to_v6: Dict[str, List[int]] = defaultdict(list)
         def mergeable_logname(n: str) -> bool:
@@ -566,29 +528,66 @@ def main():
                 else:
                     edges.append((i4, i6, "LOGNAME"))
 
-        # 2) MAC neighbor linking
+        # 2) MAC linking (quiet)
         if args.mac_link:
             for i, r in enumerate(rows):
                 if r["v"] == 4 and r["ip"] in mac_by_ip4:
                     mac = mac_by_ip4[r["ip"]]
-                    # find v6 rows with same mac
                     for j, rv6 in enumerate(rows):
                         if rv6["v"] == 6 and mac_by_ip6.get(rv6["ip"]) == mac:
                             edges.append((i, j, "MAC"))
 
-        # Union all edges
-        for a, b, _ in edges:
-            union(a, b)
+        # 3) TLS cert fingerprint linking (active, optional)
+        tls_ports: List[int] = []
+        if args.tls_link:
+            for p in args.tls_link.split(","):
+                p = p.strip()
+                if p.isdigit(): tls_ports.append(int(p))
+        if tls_ports:
+            fp_map_v4: Dict[Tuple[int,str], List[int]] = defaultdict(list)
+            fp_map_v6: Dict[Tuple[int,str], List[int]] = defaultdict(list)
+            for i, r in enumerate(rows):
+                for port in tls_ports:
+                    fp = tls_cert_fingerprint_sha256(r["ip"], port, timeout=4.0)
+                    if not fp: continue
+                    key = (port, fp)
+                    if r["v"] == 4: fp_map_v4[key].append(i)
+                    elif r["v"] == 6: fp_map_v6[key].append(i)
+            # only unambiguous 1 v4 ↔ 1 v6
+            for key in set(fp_map_v4) & set(fp_map_v6):
+                v4_list, v6_list = fp_map_v4[key], fp_map_v6[key]
+                if len(v4_list) == 1 and len(v6_list) == 1:
+                    edges.append((v4_list[0], v6_list[0], f"TLSCERT:{key[0]}"))
 
-        # Build components for phased DNS correlation
+        # 4) SSH host key linking (active, optional)
+        if args.ssh_link:
+            ssh_map_v4: Dict[str, List[int]] = defaultdict(list)
+            ssh_map_v6: Dict[str, List[int]] = defaultdict(list)
+            for i, r in enumerate(rows):
+                fp = ssh_hostkey_fingerprint_sha256(r["ip"], port=22, timeout=3.5)
+                if not fp: continue
+                if r["v"] == 4: ssh_map_v4[fp].append(i)
+                elif r["v"] == 6: ssh_map_v6[fp].append(i)
+            for fp in set(ssh_map_v4) & set(ssh_map_v6):
+                if len(ssh_map_v4[fp]) == 1 and len(ssh_map_v6[fp]) == 1:
+                    edges.append((ssh_map_v4[fp][0], ssh_map_v6[fp][0], "SSHKEY"))
+
+        # Union initial edges
+        for a,b,reason in edges:
+            union(a,b)
+            if args.why_merge:
+                rows[a]["flags"].add("MERGED_BY_"+reason)
+                rows[b]["flags"].add("MERGED_BY_"+reason)
+
+        # Build components helper
         def components_map():
             comps = defaultdict(set)
             for i in range(len(rows)): comps[find(i)].add(i)
             return comps
 
-        # PHASE 1: v4-only comps → AAAA (and synthesized FQDNs) → union v6 rows
+        # PHASE 1: v4-only comps → AAAA (with synth) → union v6 rows
         comps = components_map()
-        for root, idxs in list(comps.items()):
+        for idxs in list(comps.values()):
             v4_idxs = [i for i in idxs if rows[i]["v"] == 4]
             v6_idxs = [i for i in idxs if rows[i]["v"] == 6]
             if v4_idxs and not v6_idxs:
@@ -597,7 +596,6 @@ def main():
                     for i in v4_idxs:
                         ln = rows[i]["log_name"]
                         if ln and "." in ln and valid_hostish(ln): names.add(ln)
-                # synthesize from short+domain if asked
                 if args.synth and known_domains:
                     shorts = set()
                     for i in v4_idxs:
@@ -607,7 +605,6 @@ def main():
                         for d in known_domains:
                             names.add(f"{sh}.{d}")
                 for nm in sorted(names):
-                    # AAAA for nm
                     for v6 in forward_lookup_AAAA(nm, args.dns):
                         j = index_by_ip.get(v6)
                         if j is not None and rows[j]["v"] == 6:
@@ -618,9 +615,9 @@ def main():
                                 if nm not in (rows[v4_idxs[0]]["resolved"], rows[v4_idxs[0]]["log_name"]):
                                     rows[v4_idxs[0]]["flags"].add("MERGED_BY_SYNTH_FQDN")
 
-        # PHASE 2: v6-only comps → A (and synthesized FQDNs) → union v4 rows
+        # PHASE 2: v6-only comps → A (with synth) → union v4 rows
         comps = components_map()
-        for root, idxs in list(comps.items()):
+        for idxs in list(comps.values()):
             v4_idxs = [i for i in idxs if rows[i]["v"] == 4]
             v6_idxs = [i for i in idxs if rows[i]["v"] == 6]
             if v6_idxs and not v4_idxs:
@@ -687,12 +684,10 @@ def main():
                     if sh: cand_shorts.add(sh)
                 target = None
                 for f in cand_fqdns:
-                    if f in fqdn_to_comp:
-                        target = fqdn_to_comp[f]; break
+                    if f in fqdn_to_comp: target = fqdn_to_comp[f]; break
                 if target is None:
                     for s in cand_shorts:
-                        if s in short_to_comp:
-                            target = short_to_comp[s]; break
+                        if s in short_to_comp: target = short_to_comp[s]; break
                 if target is not None:
                     any_v6 = next(iter(v6_idxs))
                     rep_v4 = next(iter([i for i in comps[target] if rows[i]["v"] == 4]))
@@ -703,6 +698,16 @@ def main():
         # Build final components and output
         comps = defaultdict(set)
         for i in range(len(rows)): comps[find(i)].add(i)
+
+        # Precompute “plain bases” to enable de-numbering
+        plain_bases = {n for n in all_names_seen if not NUM_SUFFIX_RX.match(n)}
+
+        def denumber(name: str) -> str:
+            if not name: return name
+            m = NUM_SUFFIX_RX.match(name)
+            if m and m.group(1) in plain_bases:
+                return m.group(1)
+            return name
 
         merged_rows = []
         consumed = set()
@@ -724,6 +729,11 @@ def main():
                     known = any(nl.endswith("." + d) or nl == d for d in known_domains)
                     return (0 if known else 1, len(n), n.lower())
                 log_pick = sorted(log_choices, key=log_score)[0] if log_choices else ""
+                # de-number if applicable
+                new_log = denumber(log_pick)
+                if new_log != log_pick:
+                    flags.add("LOGNAME_DENUMBERED")
+                    log_pick = new_log
                 merged_rows.append({
                     "ipv4": ";".join(ipv4_addrs),
                     "ipv6": ";".join(ipv6_addrs),
@@ -736,10 +746,16 @@ def main():
 
         for i, r in enumerate(rows):
             if i in consumed: continue
+            log_pick = r["log_name"]
+            new_log = log_pick
+            m = NUM_SUFFIX_RX.match(log_pick or "")
+            if m and m.group(1) in plain_bases:
+                new_log = m.group(1)
+                r["flags"].add("LOGNAME_DENUMBERED")
             merged_rows.append({
                 "ipv4": r["ip"] if r["v"] == 4 else "",
                 "ipv6": r["ip"] if r["v"] == 6 else "",
-                "log_name": r["log_name"],
+                "log_name": new_log,
                 "resolved": r["resolved"],
                 "protos": "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN",
                 "flags": "|".join(sorted(r["flags"])) if r["flags"] else ""
@@ -756,13 +772,25 @@ def main():
             print(",".join(row))
         return
 
-    # Non-merged output
+    # Non-merged output (no --merge6)
+    # (We still de-number single rows for nicer presentation)
+    plain_bases = {n for n in all_names_seen if not NUM_SUFFIX_RX.match(n)}
+    def denumber(name: str) -> str:
+        if not name: return name
+        m = NUM_SUFFIX_RX.match(name)
+        if m and m.group(1) in plain_bases:
+            return m.group(1)
+        return name
+
     if args.header:
         cols = ["IP","LOG_NAME","RESOLVED_NAME","PROTOS"]
         if args.flags: cols.append("FLAGS")
         print(",".join(cols))
     for r in rows:
-        row = [r["ip"], r["log_name"], r["resolved"], "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN"]
+        log_pick = denumber(r["log_name"])
+        if log_pick != r["log_name"]:
+            r["flags"].add("LOGNAME_DENUMBERED")
+        row = [r["ip"], log_pick, r["resolved"], "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN"]
         if args.flags:
             row.append("|".join(sorted(r["flags"])) if r["flags"] else "")
         print(",".join(row))
