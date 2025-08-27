@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Responder poisoned client summarizer (domain-aware, multi-resolver, IPv6→IPv4 merge).
+Responder poisoned client summarizer (domain-aware, multi-resolver, IPv6→IPv4 merge with log-name tie-in).
 
 Default (one row per poisoned client IP):
   IP,LOG_NAME,RESOLVED_NAME,PROTOS[,FLAGS]
@@ -8,12 +8,12 @@ Default (one row per poisoned client IP):
 Key options:
   --resolve                 # run full resolver chain rdns,dns,getent,nxc
   --resolve-chain ...       # modify resolver order (e.g., rdns,nxc,dns)
-  --merge6                  # (alias: --merge-v4v6) merge IPv6 entries into IPv4 rows when we can correlate
+  --merge6                  # (alias: --merge-v4v6) merge IPv6 rows into IPv4 rows when correlated
   --domain DNS[=NETBIOS]    # e.g., --domain some-domain.local=SOME-DOMAIN (repeatable)
   --netbios NB[=DNS]        # e.g., --netbios SOME-DOMAIN=some-domain.local (repeatable)
   --ban-name NAME           # exact log names to ignore (repeatable)
   --no-ban-defaults         # disables auto-bans wpad.local / https.local
-  --flags                   # include reasons/notes
+  --flags                   # include a FLAGS column
 """
 
 import argparse, os, re, ipaddress, socket, subprocess
@@ -301,7 +301,6 @@ def resolve_chain(ip_s: str, chain: List[str], dns_servers: List[str], nxc_timeo
 
 # ---------- sorting helpers ----------
 def ip_sort_key_str(ip_str: str):
-    """Sort a single IP string numerically, IPv4 before IPv6."""
     try:
         addr = ipaddress.ip_address(ip_str)
         return (0 if addr.version == 4 else 1, addr)
@@ -309,19 +308,12 @@ def ip_sort_key_str(ip_str: str):
         return (2, ip_str)
 
 def merged_row_sort_key(row: dict):
-    """
-    Sort merged rows:
-      1) Rows with IPv4(s) first, by smallest IPv4
-      2) Then rows with only IPv6(s), by smallest IPv6
-      3) Fallback by names
-    """
     v4s = [ipaddress.ip_address(x) for x in row["ipv4"].split(";") if x]
     v6s = [ipaddress.ip_address(x) for x in row["ipv6"].split(";") if x]
     if v4s:
         return (0, min(v4s))
     if v6s:
         return (1, min(v6s))
-    # no IPs? very unlikely, but keep stable
     return (2, row.get("resolved","") or row.get("log_name",""))
 
 # ---------- main ----------
@@ -352,7 +344,6 @@ def main():
     if not args.no_ban_defaults:
         banned_names |= DEFAULT_BANNED
 
-    # Resolver chain
     chain = [t.strip().lower() for t in args.resolve_chain.split(",") if t.strip()]
     if args.resolve and args.resolve_chain == "rdns":
         chain = ["rdns", "dns", "getent", "nxc"]
@@ -389,7 +380,7 @@ def main():
                 if service:
                     e["services"].add(service)
 
-    # Build per-IP rows
+    # Build per-IP rows (store full set of observed names for later log-name merge)
     rows = []
     for ip_s in sorted(clients.keys(), key=ip_sort_key_str):
         e = clients[ip_s]
@@ -399,7 +390,6 @@ def main():
         flags |= pick_flags
         resolved = resolve_chain(ip_s, chain, args.dns, args.nxc_timeout) if chain else ""
 
-        # domain-aware cleanup of LOG_NAME
         if log_name and log_name.lower() in known_domains:
             log_name = ""
             flags.add("BLANKED_DOMAIN_LOGNAME")
@@ -417,7 +407,8 @@ def main():
             "log_name": log_name,
             "resolved": resolved,
             "protos": set(p for p in e["protos"] if p != "UNKNOWN") or {"UNKNOWN"},
-            "flags": flags
+            "flags": flags,
+            "names_all": set(e["name_counts"].keys()),  # <--- added
         })
 
     # Merge IPv6 into IPv4 if asked
@@ -436,15 +427,16 @@ def main():
                 return r["log_name"].lower()
             return ""
 
+        # ---- 1) group by canonical name (resolved/log_name) ----
         groups: Dict[str, List[int]] = defaultdict(list)
         for i, r in enumerate(rows):
             cn = canon_name(r)
             if cn:
                 groups[cn].append(i)
 
+        # ---- 2) v6 resolved -> forward A tie to v4 ----
         ip_to_index = {r["ip"]: i for i, r in enumerate(rows)}
         for i, r in enumerate(rows):
-            # Try correlating v6 row to v4 via forward A of its resolved name
             if r["v"] == 6 and valid_hostish(r["resolved"]):
                 a_ips = forward_lookup_A(r["resolved"], args.dns)
                 for a in a_ips:
@@ -454,12 +446,53 @@ def main():
                         groups[cn].append(i)
                         groups[cn].append(j)
 
-        # Dedup indices per group
+        # ---- 3) NEW: log-name merge (safe) ----
+        # Build name -> (v4 indices, v6 indices) map using names_all
+        name_to_v4: Dict[str, List[int]] = defaultdict(list)
+        name_to_v6: Dict[str, List[int]] = defaultdict(list)
+
+        def mergeable_logname(n: str) -> bool:
+            if not n: return False
+            nl = n.lower()
+            if nl in banned_names: return False
+            if nl in known_domains: return False
+            return True  # allow .local etc., including GUID.local
+
+        for i, r in enumerate(rows):
+            for nm in r["names_all"]:
+                nl = nm.lower()
+                if not mergeable_logname(nl):
+                    continue
+                if r["v"] == 4:
+                    name_to_v4[nl].append(i)
+                elif r["v"] == 6:
+                    name_to_v6[nl].append(i)
+
+        for nm in set(name_to_v4.keys()) & set(name_to_v6.keys()):
+            v4_list = name_to_v4[nm]
+            v6_list = name_to_v6[nm]
+            # Only merge when unambiguous: exactly one v4 row and one v6 row share this log name
+            if len(v4_list) == 1 and len(v6_list) == 1:
+                i4, i6 = v4_list[0], v6_list[0]
+                r4, r6 = rows[i4], rows[i6]
+                # If both have resolved names and they disagree, skip
+                if r4["resolved"] and r6["resolved"] and r4["resolved"].lower() != r6["resolved"].lower():
+                    continue
+                # Add both to a common group keyed by 'ln:<name>'
+                key = f"ln:{nm}"
+                groups[key].append(i4)
+                groups[key].append(i6)
+                # Mark both rows
+                r4["flags"].add("MERGED_BY_LOGNAME")
+                r6["flags"].add("MERGED_BY_LOGNAME")
+
+        # Dedup & build merged rows
         for k in list(groups.keys()):
             groups[k] = sorted(set(groups[k]))
 
         merged_rows = []
         consumed = set()
+
         for cn, idxs in groups.items():
             ipv4s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 4}, key=ipaddress.ip_address)
             ipv6s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 6}, key=ipaddress.ip_address)
@@ -470,7 +503,7 @@ def main():
             resolved_choices = [rows[i]["resolved"] for i in idxs if rows[i]["resolved"]]
             resolved_pick = ""
             for rv in resolved_choices:
-                if rv.lower() == cn:
+                if rv.lower() == cn.replace("ln:","",1):
                     resolved_pick = rv
                     break
             if not resolved_pick and resolved_choices:
@@ -495,7 +528,7 @@ def main():
             })
             consumed.update(idxs)
 
-        # Add any rows that did not fall into a merge group, as singletons
+        # Add remaining rows that didn’t merge
         for i, r in enumerate(rows):
             if i in consumed:
                 continue
@@ -508,10 +541,9 @@ def main():
                 "flags": "|".join(sorted(r["flags"])) if r["flags"] else ""
             })
 
-        # FINAL SORT (after merge): v4-first numeric, then v6-only numeric
+        # Final sort: v4-first numeric, then v6-only numeric
         merged_rows.sort(key=merged_row_sort_key)
 
-        # Output merged layout
         if args.header:
             cols = ["IPv4","IPv6","LOG_NAME","RESOLVED_NAME","PROTOS"]
             if args.flags: cols.append("FLAGS")
@@ -522,7 +554,7 @@ def main():
             print(",".join(row))
         return
 
-    # Non-merged output (IPv4 before IPv6, both numerically sorted)
+    # Non-merged output
     if args.header:
         cols = ["IP","LOG_NAME","RESOLVED_NAME","PROTOS"]
         if args.flags: cols.append("FLAGS")
