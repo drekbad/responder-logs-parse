@@ -5,25 +5,11 @@ Responder poisoned client summarizer (domain-aware + ban-names + multi-resolver)
 One row per poisoned client IP:
   IP,LOG_NAME,RESOLVED_NAME,PROTOS[,FLAGS]
 
-LOG_NAME is chosen ONLY from the logs. It is blanked if:
-  - it equals a known DNS domain you provided, or
-  - it matches a banned name (e.g., wpad.local), or
-  - RESOLVED_NAME is host.domain and LOG_NAME equals just that domain (or its mapped NetBIOS).
-
-Resolution chain is configurable and tried in order until something returns:
-  rdns  -> Python socket reverse lookup (fast)
-  dns   -> 'dig -x' and/or 'host' (optional @server; repeatable)
-  getent-> 'getent hosts'
-  nxc   -> 'nxc smb <IP>' (parse "(name:HOST)" and "(domain:DOM)")
-
-Examples:
-  python3 poisoned_clients.py
-  python3 poisoned_clients.py --resolve-chain rdns,dns --dns 10.0.0.10 --dns 10.0.0.11
-  python3 poisoned_clients.py --resolve-chain rdns,nxc --nxc-timeout 4 --flags
-  python3 poisoned_clients.py --domain some-domain.local --netbios SOME-DOMAIN=some-domain.local --ban-name wpad.local --ban-name https.local
+LOG_NAME is chosen ONLY from the logs; RESOLVED_NAME is optional (via a resolver chain).
+LOG_NAME is blanked if it is just a domain, a banned name, or a NetBIOS label mapped to the resolved domain.
 """
 
-import argparse, os, re, ipaddress, socket, subprocess, shlex
+import argparse, os, re, ipaddress, socket, subprocess
 from collections import defaultdict, Counter
 from typing import Optional, Dict, Iterable, Tuple, Set, List
 
@@ -59,14 +45,57 @@ def is_single_label_mdns(name: str) -> bool:
     parts = name.split(".")
     return len(parts) == 2 and parts[1].lower() == "local"
 
-def parse_netbios_pairs(pairs: Iterable[str]) -> Dict[str, str]:
-    out = {}
+def parse_netbios_map(pairs: Iterable[str]) -> Dict[str, str]:
+    """Parse NETBIOS=DNS form into {NETBIOS: dns.domain}"""
+    out: Dict[str, str] = {}
     for p in pairs:
         if "=" in p:
             left, right = p.split("=", 1)
-            if left and right:
-                out[left.strip().upper()] = right.strip().lower()
+            nb = left.strip().upper()
+            dns = right.strip().lower()
+            if nb and dns:
+                out[nb] = dns
     return out
+
+def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str]) -> Tuple[Set[str], Dict[str,str], Set[str]]:
+    """
+    Accept:
+      --domain some-domain.local
+      --domain some-domain.local=SOME-DOMAIN   (DNS=NETBIOS)
+      --netbios SOME-DOMAIN=some-domain.local
+      --netbios SOME-DOMAIN                    (bare; auto-map if exactly one domain, else treated as 'bare NB only')
+    Returns (known_domains, known_netbios_map, bare_netbios_set)
+    """
+    known_domains: Set[str] = set()
+    known_netbios: Dict[str,str] = {}
+
+    # Domains may be given as DNS or DNS=NETBIOS
+    for d in domain_flags:
+        if "=" in d:
+            dns, nb = d.split("=", 1)
+            dns = dns.strip().lower()
+            nb  = nb.strip().upper()
+            if dns:
+                known_domains.add(dns)
+            if dns and nb:
+                known_netbios[nb] = dns
+        else:
+            dns = d.strip().lower()
+            if dns:
+                known_domains.add(dns)
+
+    # NetBIOS flags: NETBIOS=DNS or bare NETBIOS
+    explicit_map = parse_netbios_map([n for n in netbios_flags if "=" in n])
+    known_netbios.update(explicit_map)
+    bare_nb = {n.strip().upper() for n in netbios_flags if "=" not in n and n.strip()}
+
+    # If exactly one domain is known, auto-map any bare NETBIOS labels to it
+    if bare_nb and len(known_domains) == 1:
+        only_dom = next(iter(known_domains))
+        for nb in bare_nb:
+            known_netbios[nb] = only_dom
+
+    return known_domains, known_netbios, bare_nb
 
 def pick_log_name(
     names: Counter,
@@ -77,15 +106,14 @@ def pick_log_name(
     banned_names: Set[str],
 ) -> Tuple[str, Set[str]]:
     """
-    Choose a representative LOG_NAME from what the IP asked for in the logs.
-    Excludes: WPAD, bare NetBIOS labels, exact known DNS domain names, and banned names.
+    Choose a representative LOG_NAME from log-observed names for this IP.
+    Excludes: WPAD, banned names (exact), bare NetBIOS labels, and names that equal a known DNS domain.
     Priority:
       1) FQDN ending in a known domain
-      2) Other multi-label FQDNs (not single-label mDNS 'host.local')
+      2) Other multi-label FQDNs (not 'host.local')
       3) Shortname that ALSO has an FQDN variant among names
       4) Plain shortname
       5) Single-label mDNS 'host.local'
-    Returns (log_name, flags).
     """
     flags = set()
     counts = Counter()
@@ -94,14 +122,14 @@ def pick_log_name(
 
     for n, c in names.items():
         u = n.upper(); nlow = n.lower()
-        if u == "WPAD":                 # literal WPAD token
+        if u == "WPAD":
             continue
-        if nlow in banned_lower:        # exact banned match
+        if nlow in banned_lower:
             flags.add("BANNED_LOGNAME_SEEN")
             continue
-        if u in known_netbios:          # bare NetBIOS domain label
+        if u in known_netbios:              # bare NetBIOS domain label
             continue
-        if nlow in lower_known_domains: # exactly a known DNS domain (not a host)
+        if nlow in lower_known_domains:     # equals a known DNS domain
             flags.add("DOMAIN_ONLY_NAME_SEEN")
             continue
         counts[n] += c
@@ -145,8 +173,7 @@ def pick_log_name(
         kind, n = item
         return (priority_rank[kind], -counts[n], len(n), n.lower())
 
-    best = min(candidates, key=score)[1]
-    return (best, flags)
+    return (min(candidates, key=score)[1], flags)
 
 # ---------- resolvers ----------
 def resolve_rdns(ip_s: str, timeout: float = 1.5) -> str:
@@ -167,7 +194,6 @@ def run_cmd(cmd: List[str], timeout: float = 2.5) -> str:
         return ""
 
 def resolve_dns_tools(ip_s: str, dns_servers: List[str]) -> str:
-    # Try dig -x first, then host
     cmds = []
     if dns_servers:
         for s in dns_servers:
@@ -182,15 +208,11 @@ def resolve_dns_tools(ip_s: str, dns_servers: List[str]) -> str:
         out = run_cmd(c)
         if not out:
             continue
-        # dig +short returns FQDN lines, maybe trailing dot
         line = out.splitlines()[0].strip()
         if not line:
             continue
-        # host output: "IP.in-addr.arpa domain name pointer host.example.com."
         if "pointer" in line:
-            fqdn = line.split()[-1].rstrip(".")
-            return fqdn
-        # dig output
+            return line.split()[-1].rstrip(".")
         if "." in line:
             return line.rstrip(".")
     return ""
@@ -198,7 +220,6 @@ def resolve_dns_tools(ip_s: str, dns_servers: List[str]) -> str:
 def resolve_getent(ip_s: str) -> str:
     out = run_cmd(["getent", "hosts", ip_s])
     if out:
-        # format: "<IP> <canonical> [aliases...]"
         parts = out.split()
         if len(parts) >= 2:
             return parts[1].rstrip(".")
@@ -206,8 +227,7 @@ def resolve_getent(ip_s: str) -> str:
 
 def tcp_port_open(ip_s: str, port: int, timeout: float = 0.6) -> bool:
     try:
-        v = ip_version(ip_s)
-        fam = socket.AF_INET6 if v == 6 else socket.AF_INET
+        fam = socket.AF_INET6 if ip_version(ip_s) == 6 else socket.AF_INET
         with socket.socket(fam, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect((ip_s, port))
@@ -219,25 +239,20 @@ NXC_NAME_RX = re.compile(r"\(name:([A-Za-z0-9_.-]+)\)")
 NXC_DOM_RX  = re.compile(r"\(domain:([A-Za-z0-9_.-]+)\)")
 
 def resolve_nxc(ip_s: str, timeout: float = 4.0) -> str:
-    # quick pre-check to avoid long hangs
     if not tcp_port_open(ip_s, 445, timeout=min(0.8, timeout)):
         return ""
-    try:
-        # nxc smb <IP> --timeout N
-        out = run_cmd(["nxc", "smb", ip_s, "--timeout", str(int(max(1, timeout)))], timeout=timeout+1.0)
-        if not out:
-            return ""
-        name = ""
-        dom = ""
-        m = NXC_NAME_RX.search(out)
-        if m: name = m.group(1)
-        m2 = NXC_DOM_RX.search(out)
-        if m2: dom = m2.group(1)
-        if name and dom and "." in dom and "." not in name:
-            return f"{name}.{dom}".rstrip(".")
-        return name or ""
-    except Exception:
+    out = run_cmd(["nxc", "smb", ip_s, "--timeout", str(int(max(1, timeout)))], timeout=timeout+1.0)
+    if not out:
         return ""
+    name = ""
+    dom = ""
+    m = NXC_NAME_RX.search(out)
+    if m: name = m.group(1)
+    m2 = NXC_DOM_RX.search(out)
+    if m2: dom = m2.group(1)
+    if name and dom and "." in dom and "." not in name:
+        return f"{name}.{dom}".rstrip(".")
+    return name or ""
 
 def resolve_chain(ip_s: str, chain: List[str], dns_servers: List[str], nxc_timeout: float) -> str:
     for step in chain:
@@ -261,8 +276,8 @@ def main():
     ap.add_argument("-d", "--logdir", default=DEFAULT_LOGDIR, help="Logs directory.")
     ap.add_argument("--header", action="store_true", help="Print CSV header row.")
     # domains / netbios
-    ap.add_argument("--domain", action="append", default=[], help="Known AD DNS domain (repeatable).")
-    ap.add_argument("--netbios", action="append", default=[], help="Map NetBIOS=DNS (repeatable), e.g. SOME-DOMAIN=some-domain.local")
+    ap.add_argument("--domain", action="append", default=[], help="DNS domain or DNS=NETBIOS (repeatable).")
+    ap.add_argument("--netbios", action="append", default=[], help="NETBIOS=DNS or bare NETBIOS (repeatable).")
     # name banning
     ap.add_argument("--ban-name", action="append", default=[], help="Exact log name to ignore (repeatable).")
     ap.add_argument("--no-ban-defaults", action="store_true", help="Do not auto-ban wpad.local / https.local.")
@@ -273,15 +288,14 @@ def main():
     ap.add_argument("--flags", action="store_true", help="Include a FLAGS column with reasons/notes.")
     args = ap.parse_args()
 
-    known_domains = {d.strip().lower() for d in args.domain if d.strip()}
-    known_netbios = parse_netbios_pairs(args.netbios)
+    known_domains, known_netbios, bare_nb = parse_domains_and_netbios(args.domain, args.netbios)
+
     banned_names = set(n.strip() for n in args.ban_name if n.strip())
-    if not args.no-ban-defaults:
+    if not args.no_ban_defaults:  # <-- fixed underscore attribute
         banned_names |= DEFAULT_BANNED
 
     chain = [t.strip().lower() for t in args.resolve_chain.split(",") if t.strip()]
 
-    # client_ip -> data
     clients = defaultdict(lambda: {
         "version": None,
         "protos": set(),
@@ -329,11 +343,9 @@ def main():
         protos_out = "|".join(sorted(p for p in e["protos"] if p != "UNKNOWN")) or "UNKNOWN"
 
         # domain-aware cleanup of LOG_NAME
-        # 1) If LOG_NAME is exactly a known domain -> blank it
         if log_name and log_name.lower() in known_domains:
             log_name = ""
             flags.add("BLANKED_DOMAIN_LOGNAME")
-        # 2) If RESOLVED_NAME is FQDN host.domain and LOG_NAME equals domain (or mapped NetBIOS) -> blank it
         if resolved and "." in resolved and log_name:
             resolved_domain = resolved.split(".", 1)[1].lower()
             if (log_name.lower() == resolved_domain) or (
