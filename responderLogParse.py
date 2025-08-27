@@ -6,16 +6,6 @@ Responder poisoned client summarizer (domain-aware, multi-resolver) with:
 - Optional MAC neighbor linking, TLS cert fingerprint linking (with SNI), SSH key linking
 - Quiet by default (DNS-only unless you include getent/nxc)
 - Output helpers to collapse or summarize very large IP lists per host
-
-Examples:
-  python3 poisoned_clients.py \
-    --resolve --resolve-chain rdns,dns \
-    --dns 10.10.10.10 --dns 10.10.10.11 \
-    --domain some-domain.local=SOMEDOMAIN \
-    --merge6 --mac-link \
-    --tls-link 443,8443,8080,8000,3389 --tls-sni \
-    --ssh-link \
-    --collapse-ip-threshold 2 --flags --why-merge --header
 """
 
 import argparse, os, re, ipaddress, socket, subprocess
@@ -33,15 +23,13 @@ LINE_RX = re.compile(
 )
 PROTO_RX = re.compile(r"\b(LLMNR|WPAD|MDNS|NBNS|NETBIOS-NS|NBT-NS)\b", re.IGNORECASE)
 
-# Capture-name mining (Responder-Session.log)
 CLIENT_RX = re.compile(r"(?i)\[(?:[A-Z0-9 -]+)\]\s+(?:NTLMv2\s+)?Client\s*:\s*(?P<ip>\S+)")
 ALT_CLIENT_RX = re.compile(r"(?i)Hash\s+captured\s+from\s+(?P<ip>\S+)")
 NAME_HINT_RX = re.compile(r"(?i)\b(?:HostName|Hostname|Workstation|Machine|Computer(?:Name)?)\s*[:=]\s*([A-Za-z0-9_.-]+)")
 
-DEFAULT_BANNED = {"wpad.local", "https.local"}  # exact (case-insensitive)
-NUM_SUFFIX_RX = re.compile(r"^([A-Za-z0-9_-]+)-(\d+)$")  # dash + digits only
+DEFAULT_BANNED = {"wpad.local", "https.local"}
+NUM_SUFFIX_RX = re.compile(r"^([A-Za-z0-9_-]+)-(\d+)$")
 
-# ---------- helpers ----------
 def normalize_proto(tok: str) -> str:
     t = tok.upper()
     if t in ("NBNS", "NETBIOS-NS"): return "NBT-NS"
@@ -49,7 +37,7 @@ def normalize_proto(tok: str) -> str:
     return "UNKNOWN"
 
 def clean_ip(ip_raw: str) -> str:
-    return ip_raw.split("%", 1)[0]  # strip IPv6 zone id
+    return ip_raw.split("%", 1)[0]
 
 def ip_version(ip_s: str) -> Optional[int]:
     try:
@@ -101,13 +89,12 @@ def ip_sort_key_str(ip_str: str):
         return (2, ip_str)
 
 def merged_row_sort_key(row: dict):
-    v4s = [ipaddress.ip_address(x) for x in row["ipv4"].split(";") if x]
-    v6s = [ipaddress.ip_address(x) for x in row["ipv6"].split(";") if x]
+    v4s = [ipaddress.ip_address(x) for x in row["ipv4"].split(";") if x and " " not in x]
+    v6s = [ipaddress.ip_address(x) for x in row["ipv6"].split(";") if x and " " not in x]
     if v4s: return (0, min(v4s))
     if v6s: return (1, min(v6s))
     return (2, row.get("resolved","") or row.get("log_name",""))
 
-# ---------- resolvers / runners ----------
 def run_cmd(cmd: List[str], timeout: float = 2.5, input_str: Optional[str] = None) -> str:
     try:
         r = subprocess.run(cmd, input=(input_str.encode() if input_str is not None else None),
@@ -222,7 +209,6 @@ def forward_lookup_AAAA(name: str, dns_servers: List[str]) -> List[str]:
                     continue
     return sorted(set(addrs))
 
-# ---------- tiny name helpers ----------
 def split_host_domain(name: str) -> Tuple[str, str]:
     if not name: return ("","")
     n = name.strip(".")
@@ -236,7 +222,6 @@ def best_name_pair(row: dict) -> Tuple[str, str, str]:
     if "." in cand: return (cand.lower(), short, dom)
     return ("", short, dom)
 
-# ---------- neighbor tables (quiet) ----------
 def load_arp_ipv4() -> Dict[str, str]:
     macs = {}
     try:
@@ -266,9 +251,7 @@ def load_ndp_ipv6() -> Dict[str, str]:
                 continue
     return macs
 
-# ---------- active linkers ----------
 def _fmt_host_for_connect(ip_s: str) -> str:
-    # openssl -connect needs [v6]:port for IPv6
     return f"[{ip_s}]" if ":" in ip_s else ip_s
 
 CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
@@ -278,14 +261,14 @@ def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0, sni:
     cmd = ["openssl", "s_client", "-connect", f"{host}:{port}", "-showcerts", "-verify", "0"]
     if sni:
         cmd += ["-servername", sni]
-    out = run_cmd(cmd, timeout=timeout, input_str="")  # empty stdin to close
+    out = run_cmd(cmd, timeout=timeout, input_str="")
     if not out: return ""
     m = CERT_RE.search(out)
     if not m: return ""
     pem = m.group(0)
     fp = run_cmd(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], timeout=2.0, input_str=pem)
     if not fp: return ""
-    parts = fp.strip().split("=")  # "SHA256 Fingerprint=AA:BB:..."
+    parts = fp.strip().split("=")
     return parts[-1].replace(":", "").upper() if parts else ""
 
 def ssh_hostkey_fingerprint_sha256(ip_s: str, port: int = 22, timeout: float = 4.0) -> str:
@@ -295,42 +278,34 @@ def ssh_hostkey_fingerprint_sha256(ip_s: str, port: int = 22, timeout: float = 4
     m = re.search(r"SHA256:([A-Za-z0-9+/=]+)", fpout or "")
     return (m.group(1) if m else "")
 
-# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(description="Summarize poisoned clients by IP from Responder logs.")
     ap.add_argument("-d", "--logdir", default=DEFAULT_LOGDIR, help="Logs directory.")
     ap.add_argument("--header", action="store_true", help="Print CSV header row.")
-    # domains / netbios
     ap.add_argument("--domain", action="append", default=[], help="DNS domain or DNS=NETBIOS (repeatable).")
     ap.add_argument("--netbios", action="append", default=[], help="NETBIOS=DNS or bare NETBIOS (repeatable).")
-    # name banning
     ap.add_argument("--ban-name", action="append", default=[], help="Exact log name to ignore (repeatable).")
     ap.add_argument("--no-ban-defaults", action="store_true", help="Do not auto-ban wpad.local / https.local.")
-    # resolvers
     ap.add_argument("--resolve", action="store_true", help="Run chain rdns,dns[,getent,nxc] (order via --resolve-chain).")
     ap.add_argument("--resolve-chain", default="rdns", help="Comma list: rdns,dns,getent,nxc")
     ap.add_argument("--dns", action="append", default=[], help="DNS server for A/AAAA/PTR lookups (repeatable).")
     ap.add_argument("--nxc-timeout", type=float, default=4.0, help="Timeout seconds for nxc smb.")
-    # extras
     ap.add_argument("--capture-names", dest="capture_names", action="store_true", default=True, help="Mine HostName/Workstation from capture logs (default on).")
     ap.add_argument("--no-capture-names", dest="capture_names", action="store_false")
     ap.add_argument("--mac-link", action="store_true", help="Merge IPv4/IPv6 by MAC from neighbor tables (quiet).")
     ap.add_argument("--synth", dest="synth", action="store_true", default=None, help="Use short+domain synthesized FQDN for extra A/AAAA lookups.")
     ap.add_argument("--no-synth", dest="synth", action="store_false")
-    # NEW active linkers
     ap.add_argument("--tls-link", default="", help="Comma-separated ports (e.g., 443,8443,3389) to link by TLS cert SHA-256 fingerprint.")
     ap.add_argument("--tls-sni", action="store_true", help="Send SNI (resolved/log FQDN or synthesized) during TLS linking.")
     ap.add_argument("--ssh-link", action="store_true", help="Link by SSH host key (SHA-256).")
-    # merge
     ap.add_argument("--merge6", "--merge-v4v6", dest="merge6", action="store_true",
                     help="Merge IPv6 rows into IPv4 rows when correlated by name/DNS/MAC/cert/ssh.")
     ap.add_argument("--flags", action="store_true", help="Include a FLAGS column (needed to view --why-merge tags).")
     ap.add_argument("--why-merge", action="store_true", help="Annotate merge reasons inside FLAGS.")
-    # output shaping for large IP sets
     ap.add_argument("--collapse-ip-threshold", type=int, default=None,
                     help="If total IPs (v4+v6) in a merged row exceed N, omit IPs and add COLLAPSED_IPS:v4=#,v6=# to FLAGS.")
     ap.add_argument("--ip-summary", type=int, default=0,
-                    help="If >0, print at most K IPs per family with ' (+X more)'. Ignored if --collapse-ip-threshold triggers.")
+                    help="If >0, show at most K IPs per family with ' (+X more)'. Ignored if collapse triggers.")
     args = ap.parse_args()
 
     known_domains, known_netbios, _ = parse_domains_and_netbios(args.domain, args.netbios)
@@ -340,12 +315,10 @@ def main():
     if not args.no_ban_defaults:
         banned_names |= DEFAULT_BANNED
 
-    # Resolver chain
     chain = [t.strip().lower() for t in args.resolve_chain.split(",") if t.strip()]
     if args.resolve and args.resolve_chain == "rdns":
         chain = ["rdns", "dns", "getent", "nxc"]
 
-    # Collect raw per-IP rows + gather all names to help de-numbering
     clients = defaultdict(lambda: {
         "version": None,
         "protos": set(),
@@ -355,7 +328,6 @@ def main():
     })
     all_names_seen: Set[str] = set()
 
-    # Parse poisoned lines
     for fname in LOG_FILES:
         path = os.path.join(args.logdir, fname)
         if not os.path.isfile(path): continue
@@ -377,7 +349,6 @@ def main():
                 if service:
                     e["services"].add(service)
 
-    # OPTIONAL: harvest capture names
     path = os.path.join(args.logdir, "Responder-Session.log")
     if args.capture_names and os.path.isfile(path):
         last_ip = ""
@@ -396,7 +367,6 @@ def main():
                             e["name_counts"][name] += 1
                             all_names_seen.add(name)
 
-    # Build per-IP rows
     def pick_log_name(names: Counter, services: Set[str], protos: Set[str],
                       known_domains: Set[str], known_netbios: Dict[str, str],
                       banned_names: Set[str]) -> Tuple[str, Set[str]]:
@@ -427,7 +397,7 @@ def main():
                 short.append(n)
         for f in fqdn_known + fqdn_other:
             s = f.split(".", 1)[0]; short_to_fqdn[s].add(f)
-        candidates = []
+        candidates: List[Tuple[str,str]] = []
         candidates.extend(("fqdn_known", n) for n in fqdn_known)
         candidates.extend(("fqdn_other", n) for n in fqdn_other)
         for s in short:
@@ -475,11 +445,9 @@ def main():
             "names_all": set(e["name_counts"].keys()),
         })
 
-    # Optional MAC neighbor linking
     mac_by_ip4 = load_arp_ipv4() if args.mac_link else {}
     mac_by_ip6 = load_ndp_ipv6() if args.mac_link else {}
 
-    # Merge IPv6 into IPv4 if asked
     if args.merge6:
         def valid_hostish(n: str) -> bool:
             if not n: return False
@@ -491,7 +459,6 @@ def main():
             if valid_hostish(r["log_name"]): return r["log_name"].lower()
             return ""
 
-        # Union-Find
         parent = {i: i for i in range(len(rows))}
         rank = {i: 0 for i in range(len(rows))}
         def find(x):
@@ -505,10 +472,9 @@ def main():
             elif rank[ra] > rank[rb]: parent[rb] = ra
             else: parent[rb] = ra; rank[ra] += 1
 
-        edges = []  # (i,j,reason)
+        edges: List[Tuple[int,int,str]] = []
         index_by_ip = {r["ip"]: i for i, r in enumerate(rows)}
 
-        # 0) group by canonical name
         by_canon: Dict[str, List[int]] = defaultdict(list)
         for i, r in enumerate(rows):
             cn = canon_name(r)
@@ -517,7 +483,6 @@ def main():
             for k in range(1, len(idxs)):
                 edges.append((idxs[0], idxs[k], "CANON_NAME"))
 
-        # 1) unambiguous log-name v4<->v6
         name_to_v4: Dict[str, List[int]] = defaultdict(list)
         name_to_v6: Dict[str, List[int]] = defaultdict(list)
         def mergeable_logname(n: str) -> bool:
@@ -541,7 +506,6 @@ def main():
                 else:
                     edges.append((i4, i6, "LOGNAME"))
 
-        # 2) MAC linking (quiet)
         if args.mac_link:
             for i, r in enumerate(rows):
                 if r["v"] == 4 and r["ip"] in mac_by_ip4:
@@ -550,26 +514,21 @@ def main():
                         if rv6["v"] == 6 and mac_by_ip6.get(rv6["ip"]) == mac:
                             edges.append((i, j, "MAC"))
 
-        # 3) TLS cert fingerprint linking (active, optional) with optional SNI
         tls_ports: List[int] = []
         if args.tls_link:
             for p in args.tls_link.split(","):
                 p = p.strip()
                 if p.isdigit(): tls_ports.append(int(p))
         if tls_ports:
-            from typing import Tuple
             fp_map_v4: Dict[Tuple[int,str], List[int]] = defaultdict(list)
             fp_map_v6: Dict[Tuple[int,str], List[int]] = defaultdict(list)
-
             def pick_sni(row: dict) -> str:
                 if not args.tls_sni:
                     return ""
-                # prefer resolved/log FQDN
                 if row.get("resolved") and "." in row["resolved"]:
                     return row["resolved"]
                 if row.get("log_name") and "." in row["log_name"]:
                     return row["log_name"]
-                # synthesize from short + any known domain
                 fqdn, short, dom = best_name_pair(row)
                 if fqdn:
                     return fqdn
@@ -577,7 +536,6 @@ def main():
                     d = sorted(known_domains)[0]
                     return f"{short}.{d}"
                 return ""
-
             for i, r in enumerate(rows):
                 for port in tls_ports:
                     sni = pick_sni(r)
@@ -586,13 +544,11 @@ def main():
                     key = (port, fp)
                     if r["v"] == 4: fp_map_v4[key].append(i)
                     elif r["v"] == 6: fp_map_v6[key].append(i)
-            # only unambiguous 1 v4 ↔ 1 v6
             for key in set(fp_map_v4) & set(fp_map_v6):
                 v4_list, v6_list = fp_map_v4[key], fp_map_v6[key]
                 if len(v4_list) == 1 and len(v6_list) == 1:
                     edges.append((v4_list[0], v6_list[0], f"TLSCERT:{key[0]}"))
 
-        # 4) SSH host key linking (active, optional)
         if args.ssh_link:
             ssh_map_v4: Dict[str, List[int]] = defaultdict(list)
             ssh_map_v6: Dict[str, List[int]] = defaultdict(list)
@@ -605,20 +561,17 @@ def main():
                 if len(ssh_map_v4[fp]) == 1 and len(ssh_map_v6[fp]) == 1:
                     edges.append((ssh_map_v4[fp][0], ssh_map_v6[fp][0], "SSHKEY"))
 
-        # Union initial edges
         for a,b,reason in edges:
             union(a,b)
             if args.why_merge:
                 rows[a]["flags"].add("MERGED_BY_"+reason)
                 rows[b]["flags"].add("MERGED_BY_"+reason)
 
-        # Build components helper
         def components_map():
             comps = defaultdict(set)
             for i in range(len(rows)): comps[find(i)].add(i)
             return comps
 
-        # PHASE 1: v4-only comps → AAAA (with synth) → union v6 rows
         comps = components_map()
         for idxs in list(comps.values()):
             v4_idxs = [i for i in idxs if rows[i]["v"] == 4]
@@ -648,7 +601,6 @@ def main():
                                 if nm not in (rows[v4_idxs[0]]["resolved"], rows[v4_idxs[0]]["log_name"]):
                                     rows[v4_idxs[0]]["flags"].add("MERGED_BY_SYNTH_FQDN")
 
-        # PHASE 2: v6-only comps → A (with synth) → union v4 rows
         comps = components_map()
         for idxs in list(comps.values()):
             v4_idxs = [i for i in idxs if rows[i]["v"] == 4]
@@ -678,9 +630,7 @@ def main():
                                 if nm not in (rows[v6_idxs[0]]["resolved"], rows[v6_idxs[0]]["log_name"]):
                                     rows[v6_idxs[0]]["flags"].add("MERGED_BY_SYNTH_FQDN")
 
-        # PHASE 3: last-ditch name fallback (FQDN then unique short)
         comps = components_map()
-        # Build v4-only name maps
         fqdn_to_comp: Dict[str, int] = {}
         short_to_comp: Dict[str, int] = {}
         fqdn_counts: Dict[str, int] = defaultdict(int)
@@ -706,6 +656,7 @@ def main():
             for s in d["short"]:
                 if short_counts[s] == 1: short_to_comp[s] = root
 
+        comps = components_map()
         for root, idxs in list(comps.items()):
             v4_idxs = [i for i in idxs if rows[i]["v"] == 4]
             v6_idxs = [i for i in idxs if rows[i]["v"] == 6]
@@ -722,19 +673,16 @@ def main():
                     for s in cand_shorts:
                         if s in short_to_comp: target = short_to_comp[s]; break
                 if target is not None:
-                    any_v6 = next(iter(v6_idxs))
+                    any_v6 = next(iter([i for i in idxs if rows[i]["v"] == 6]))
                     rep_v4 = next(iter([i for i in comps[target] if rows[i]["v"] == 4]))
                     union(any_v6, rep_v4)
                     if args.why_merge:
                         rows[any_v6]["flags"].add("MERGED_BY_FQDN" if cand_fqdns else "MERGED_BY_SHORT")
 
-        # Build final components and output
         comps = defaultdict(set)
         for i in range(len(rows)): comps[find(i)].add(i)
 
-        # Precompute “plain bases” to enable de-numbering
         plain_bases = {n for n in all_names_seen if not NUM_SUFFIX_RX.match(n)}
-
         def denumber(name: str) -> str:
             if not name: return name
             m = NUM_SUFFIX_RX.match(name)
@@ -744,7 +692,6 @@ def main():
 
         def render_ips(v4_list: List[str], v6_list: List[str], flags_set: Set[str]) -> Tuple[str,str]:
             total = len(v4_list) + len(v6_list)
-            # Collapse wins over summary
             if args.collapse_ip_threshold is not None and total > args.collapse_ip_threshold:
                 flags_set.add(f"COLLAPSED_IPS:v4={len(v4_list)},v6={len(v6_list)}")
                 return ("", "")
@@ -756,7 +703,6 @@ def main():
                     rest = len(lst) - args.ip_summary
                     return f"{shown} (+{rest} more)"
                 return (fmt(v4_list), fmt(v6_list))
-            # default: full lists
             return (";".join(v4_list), ";".join(v6_list))
 
         merged_rows = []
@@ -779,7 +725,6 @@ def main():
                     known = any(nl.endswith("." + d) or nl == d for d in known_domains)
                     return (0 if known else 1, len(n), n.lower())
                 log_pick = sorted(log_choices, key=log_score)[0] if log_choices else ""
-                # de-number if applicable
                 new_log = denumber(log_pick)
                 if new_log != log_pick:
                     flags.add("LOGNAME_DENUMBERED")
@@ -827,7 +772,6 @@ def main():
             print(",".join(row))
         return
 
-    # Non-merged output (no --merge6)
     plain_bases = {n for n in all_names_seen if not NUM_SUFFIX_RX.match(n)}
     def denumber(name: str) -> str:
         if not name: return name
