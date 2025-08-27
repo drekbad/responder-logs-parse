@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """
-Responder poisoned client summarizer (domain-aware + ban-names + multi-resolver).
+Responder poisoned client summarizer (domain-aware, multi-resolver, v4/v6 merge).
 
-One row per poisoned client IP:
+Default output (one row per poisoned client IP):
   IP,LOG_NAME,RESOLVED_NAME,PROTOS[,FLAGS]
 
-LOG_NAME is chosen ONLY from the logs; RESOLVED_NAME is optional (via a resolver chain).
-LOG_NAME is blanked if it is just a domain, a banned name, or a NetBIOS label mapped to the resolved domain.
+Key options:
+  --resolve                 # run full resolver chain rdns,dns,getent,nxc
+  --resolve-chain ...       # modify resolver order (e.g., rdns,nxc,dns)
+  --merge-v4v6              # combine IPv4/IPv6 rows for the same host into one line
+  --domain DNS[=NETBIOS]    # e.g., --domain some-domain.local=SOME-DOMAIN (repeatable)
+  --netbios NB[=DNS]        # e.g., --netbios SOME-DOMAIN=some-domain.local (repeatable)
+  --ban-name NAME           # exact log names to ignore (repeatable)
+  --no-ban-defaults         # disables auto-bans wpad.local / https.local
+  --flags                   # include reasons/notes
+
+Examples:
+  python3 poisoned_clients.py --resolve \
+    --domain some-domain.local=SOME-DOMAIN \
+    --ban-name fakepad.local \
+    --dns 10.10.10.10 --dns 10.10.10.11 \
+    --merge-v4v6 --flags --header
 """
 
 import argparse, os, re, ipaddress, socket, subprocess
@@ -26,6 +40,7 @@ PROTO_RX = re.compile(r"\b(LLMNR|WPAD|MDNS|NBNS|NETBIOS-NS|NBT-NS)\b", re.IGNORE
 
 DEFAULT_BANNED = {"wpad.local", "https.local"}  # exact matches (case-insensitive)
 
+# ---------- small helpers ----------
 def normalize_proto(tok: str) -> str:
     t = tok.upper()
     if t in ("NBNS", "NETBIOS-NS"): return "NBT-NS"
@@ -46,7 +61,6 @@ def is_single_label_mdns(name: str) -> bool:
     return len(parts) == 2 and parts[1].lower() == "local"
 
 def parse_netbios_map(pairs: Iterable[str]) -> Dict[str, str]:
-    """Parse NETBIOS=DNS form into {NETBIOS: dns.domain}"""
     out: Dict[str, str] = {}
     for p in pairs:
         if "=" in p:
@@ -61,15 +75,13 @@ def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str])
     """
     Accept:
       --domain some-domain.local
-      --domain some-domain.local=SOME-DOMAIN   (DNS=NETBIOS)
+      --domain some-domain.local=SOME-DOMAIN
       --netbios SOME-DOMAIN=some-domain.local
-      --netbios SOME-DOMAIN                    (bare; auto-map if exactly one domain, else treated as 'bare NB only')
-    Returns (known_domains, known_netbios_map, bare_netbios_set)
+      --netbios SOME-DOMAIN   (auto-map if exactly one domain is set)
     """
     known_domains: Set[str] = set()
     known_netbios: Dict[str,str] = {}
 
-    # Domains may be given as DNS or DNS=NETBIOS
     for d in domain_flags:
         if "=" in d:
             dns, nb = d.split("=", 1)
@@ -84,12 +96,10 @@ def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str])
             if dns:
                 known_domains.add(dns)
 
-    # NetBIOS flags: NETBIOS=DNS or bare NETBIOS
     explicit_map = parse_netbios_map([n for n in netbios_flags if "=" in n])
     known_netbios.update(explicit_map)
     bare_nb = {n.strip().upper() for n in netbios_flags if "=" not in n and n.strip()}
 
-    # If exactly one domain is known, auto-map any bare NETBIOS labels to it
     if bare_nb and len(known_domains) == 1:
         only_dom = next(iter(known_domains))
         for nb in bare_nb:
@@ -97,6 +107,7 @@ def parse_domains_and_netbios(domain_flags: List[str], netbios_flags: List[str])
 
     return known_domains, known_netbios, bare_nb
 
+# ---------- LOG_NAME selection ----------
 def pick_log_name(
     names: Counter,
     services: Set[str],
@@ -106,7 +117,7 @@ def pick_log_name(
     banned_names: Set[str],
 ) -> Tuple[str, Set[str]]:
     """
-    Choose a representative LOG_NAME from log-observed names for this IP.
+    Choose LOG_NAME strictly from log-observed names for this IP.
     Excludes: WPAD, banned names (exact), bare NetBIOS labels, and names that equal a known DNS domain.
     Priority:
       1) FQDN ending in a known domain
@@ -127,9 +138,9 @@ def pick_log_name(
         if nlow in banned_lower:
             flags.add("BANNED_LOGNAME_SEEN")
             continue
-        if u in known_netbios:              # bare NetBIOS domain label
+        if u in known_netbios:
             continue
-        if nlow in lower_known_domains:     # equals a known DNS domain
+        if nlow in lower_known_domains:
             flags.add("DOMAIN_ONLY_NAME_SEEN")
             continue
         counts[n] += c
@@ -156,7 +167,7 @@ def pick_log_name(
 
     candidates = []
     candidates.extend(("fqdn_known", n) for n in fqdn_known)
-    candidates.extend(("fqdn_other", n) for n in fqdn_other)
+    candidates.extend(("fqdn_other", n) for n in fqdn_other))
     for s in short:
         if s in short_to_fqdn:
             candidates.append(("short_with_fqdn", s))
@@ -254,6 +265,32 @@ def resolve_nxc(ip_s: str, timeout: float = 4.0) -> str:
         return f"{name}.{dom}".rstrip(".")
     return name or ""
 
+def forward_lookup_A(name: str, dns_servers: List[str]) -> List[str]:
+    """Return list of IPv4 A records for a hostname (best-effort)."""
+    addrs: List[str] = []
+    if not name:
+        return addrs
+    cmds = []
+    if dns_servers:
+        for s in dns_servers:
+            cmds.append(["dig", "+short", name, "A", "@"+s, "+time=1", "+tries=1"])
+        for s in dns_servers:
+            cmds.append(["getent", "hosts", name])
+    else:
+        cmds.append(["dig", "+short", name, "A", "+time=1", "+tries=1"])
+        cmds.append(["getent", "hosts", name])
+    for c in cmds:
+        out = run_cmd(c)
+        if not out:
+            continue
+        for line in out.splitlines():
+            tok = line.strip().split()
+            for t in tok:
+                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", t):
+                    addrs.append(t)
+    # dedupe
+    return sorted(set(addrs))
+
 def resolve_chain(ip_s: str, chain: List[str], dns_servers: List[str], nxc_timeout: float) -> str:
     for step in chain:
         if step == "rdns":
@@ -272,7 +309,7 @@ def resolve_chain(ip_s: str, chain: List[str], dns_servers: List[str], nxc_timeo
 
 # ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Summarize poisoned clients by IP from Responder logs (domain-aware, resolvers, ban-names).")
+    ap = argparse.ArgumentParser(description="Summarize poisoned clients by IP from Responder logs.")
     ap.add_argument("-d", "--logdir", default=DEFAULT_LOGDIR, help="Logs directory.")
     ap.add_argument("--header", action="store_true", help="Print CSV header row.")
     # domains / netbios
@@ -282,20 +319,26 @@ def main():
     ap.add_argument("--ban-name", action="append", default=[], help="Exact log name to ignore (repeatable).")
     ap.add_argument("--no-ban-defaults", action="store_true", help="Do not auto-ban wpad.local / https.local.")
     # resolvers
+    ap.add_argument("--resolve", action="store_true", help="Run full chain rdns,dns,getent,nxc (you can still override order with --resolve-chain).")
     ap.add_argument("--resolve-chain", default="rdns", help="Comma list from: rdns,dns,getent,nxc (order matters).")
-    ap.add_argument("--dns", action="append", default=[], help="DNS server for 'dns' resolver (repeatable).")
+    ap.add_argument("--dns", action="append", default=[], help="DNS server for 'dns' and forward A lookups (repeatable).")
     ap.add_argument("--nxc-timeout", type=float, default=4.0, help="Timeout seconds for nxc smb.")
+    ap.add_argument("--merge-v4v6", action="store_true", help="Merge IPv4 and IPv6 rows for the same host.")
     ap.add_argument("--flags", action="store_true", help="Include a FLAGS column with reasons/notes.")
     args = ap.parse_args()
 
-    known_domains, known_netbios, bare_nb = parse_domains_and_netbios(args.domain, args.netbios)
+    known_domains, known_netbios, _ = parse_domains_and_netbios(args.domain, args.netbios)
 
     banned_names = set(n.strip() for n in args.ban_name if n.strip())
-    if not args.no_ban_defaults:  # <-- fixed underscore attribute
+    if not args.no_ban_defaults:
         banned_names |= DEFAULT_BANNED
 
+    # Determine resolver chain
     chain = [t.strip().lower() for t in args.resolve_chain.split(",") if t.strip()]
+    if args.resolve and args.resolve_chain == "rdns":
+        chain = ["rdns", "dns", "getent", "nxc"]
 
+    # Collect raw per-IP rows
     clients = defaultdict(lambda: {
         "version": None,
         "protos": set(),
@@ -327,20 +370,14 @@ def main():
                 if service:
                     e["services"].add(service)
 
-    if args.header:
-        cols = ["IP","LOG_NAME","RESOLVED_NAME","PROTOS"]
-        if args.flags:
-            cols.append("FLAGS")
-        print(",".join(cols))
-
+    # Build rows
+    rows = []
     for ip_s in sorted(clients.keys(), key=lambda s: (ip_version(s) or 9, s)):
         e = clients[ip_s]
         flags = set()
         log_name, pick_flags = pick_log_name(e["name_counts"], e["services"], e["protos"], known_domains, known_netbios, banned_names)
         flags |= pick_flags
-
         resolved = resolve_chain(ip_s, chain, args.dns, args.nxc_timeout) if chain else ""
-        protos_out = "|".join(sorted(p for p in e["protos"] if p != "UNKNOWN")) or "UNKNOWN"
 
         # domain-aware cleanup of LOG_NAME
         if log_name and log_name.lower() in known_domains:
@@ -354,9 +391,137 @@ def main():
                 log_name = ""
                 flags.add("BLANKED_DOMAIN_LOGNAME_BY_RESOLVED")
 
-        row = [ip_s, log_name, resolved, protos_out]
+        rows.append({
+            "ip": ip_s,
+            "v": e["version"],
+            "log_name": log_name,
+            "resolved": resolved,
+            "protos": set(p for p in e["protos"] if p != "UNKNOWN") or {"UNKNOWN"},
+            "flags": flags
+        })
+
+    # Optionally MERGE v4/v6
+    if args.merge_v4v6:
+        # canonical name for merge: prefer valid resolved FQDN; else valid log_name
+        def valid_hostish(n: str) -> bool:
+            if not n: return False
+            nl = n.lower()
+            if nl in banned_names: return False
+            if nl in known_domains: return False
+            return True
+
+        def canon_name(r: dict) -> str:
+            if valid_hostish(r["resolved"]):
+                return r["resolved"].lower()
+            if valid_hostish(r["log_name"]):
+                # If it's a plain shortname and exactly one domain is known, we could expand it,
+                # but keep it as-is to avoid false merges across multiple domains.
+                return r["log_name"].lower()
+            return ""
+
+        # First pass: group by canonical name (non-empty)
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for i, r in enumerate(rows):
+            cn = canon_name(r)
+            if cn:
+                groups[cn].append(i)
+
+        # Second pass: for IPv6 rows with a resolved name, try forward A to find matching IPv4 IPs
+        ip_to_index = {r["ip"]: i for i, r in enumerate(rows)}
+        for i, r in enumerate(rows):
+            if r["v"] == 6 and valid_hostish(r["resolved"]):
+                a_ips = forward_lookup_A(r["resolved"], args.dns)
+                for a in a_ips:
+                    j = ip_to_index.get(a)
+                    if j is not None:
+                        cn = r["resolved"].lower()
+                        groups[cn].append(i)
+                        groups[cn].append(j)
+
+        # Deduplicate indices per group
+        for k in list(groups.keys()):
+            groups[k] = sorted(set(groups[k]))
+
+        # Build a set of indices that are part of some group
+        grouped_idx = set()
+        for idxs in groups.values():
+            grouped_idx.update(idxs)
+
+        merged_rows = []
+        consumed = set()
+        for cn, idxs in groups.items():
+            # Aggregate
+            ipv4s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 4})
+            ipv6s = sorted({rows[i]["ip"] for i in idxs if rows[i]["v"] == 6})
+            protos = set().union(*(rows[i]["protos"] for i in idxs))
+            flags = set().union(*(rows[i]["flags"] for i in idxs))
+            flags.add("MERGED_V4V6")
+
+            # Pick representative names
+            # Prefer resolved FQDN that matches cn; else any resolved; else best log_name.
+            resolved_choices = [rows[i]["resolved"] for i in idxs if rows[i]["resolved"]]
+            resolved_pick = ""
+            for rv in resolved_choices:
+                if rv.lower() == cn:
+                    resolved_pick = rv
+                    break
+            if not resolved_pick and resolved_choices:
+                # choose the longest (heuristic for FQDN) then lexicographic
+                resolved_pick = sorted(resolved_choices, key=lambda x: (-len(x), x.lower()))[0]
+
+            log_choices = [rows[i]["log_name"] for i in idxs if rows[i]["log_name"]]
+            log_pick = ""
+            if log_choices:
+                # prefer FQDNs that end with a known domain
+                def log_score(n):
+                    nl = n.lower()
+                    known = any(nl.endswith("." + d) or nl == d for d in known_domains)
+                    return (0 if known else 1, len(n), n.lower())
+                log_pick = sorted(log_choices, key=log_score)[0]
+
+            merged_rows.append({
+                "ipv4": ";".join(ipv4s),
+                "ipv6": ";".join(ipv6s),
+                "log_name": log_pick,
+                "resolved": resolved_pick,
+                "protos": "|".join(sorted(protos)) if protos else "UNKNOWN",
+                "flags": "|".join(sorted(flags)) if flags else ""
+            })
+            consumed.update(idxs)
+
+        # Add any rows that did not fall into a merge group, emitted as singletons
+        for i, r in enumerate(rows):
+            if i in consumed:
+                continue
+            merged_rows.append({
+                "ipv4": r["ip"] if r["v"] == 4 else "",
+                "ipv6": r["ip"] if r["v"] == 6 else "",
+                "log_name": r["log_name"],
+                "resolved": r["resolved"],
+                "protos": "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN",
+                "flags": "|".join(sorted(r["flags"])) if r["flags"] else ""
+            })
+
+        # Output merged layout
+        if args.header:
+            cols = ["IPv4","IPv6","LOG_NAME","RESOLVED_NAME","PROTOS"]
+            if args.flags: cols.append("FLAGS")
+            print(",".join(cols))
+        for m in merged_rows:
+            row = [m["ipv4"], m["ipv6"], m["log_name"], m["resolved"], m["protos"]]
+            if args.flags: row.append(m["flags"])
+            print(",".join(row))
+        return
+
+    # Non-merged output (default)
+    if args.header:
+        cols = ["IP","LOG_NAME","RESOLVED_NAME","PROTOS"]
+        if args.flags: cols.append("FLAGS")
+        print(",".join(cols))
+    for r in rows:
+        row = [r["ip"], r["log_name"], r["resolved"], "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN"]
         if args.flags:
-            row.append("|".join(sorted(flags)))
+            row.append("|".join(sorted(r["flags"])) if r["flags"] else "")
         print(",".join(row))
 
 if __name__ == "__main__":
