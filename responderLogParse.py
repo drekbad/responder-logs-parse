@@ -5,6 +5,7 @@ Responder poisoned client summarizer (domain-aware, multi-resolver) with:
 - Canon-name, log-name, DNS AAAA/A, synthesized FQDN, capture-name hints
 - Optional MAC neighbor linking, TLS cert fingerprint linking (with SNI), SSH key linking
 - Quiet by default (DNS-only unless you include getent/nxc)
+- Output helpers to collapse or summarize very large IP lists per host
 
 Examples:
   python3 poisoned_clients.py \
@@ -14,7 +15,7 @@ Examples:
     --merge6 --mac-link \
     --tls-link 443,8443,8080,8000,3389 --tls-sni \
     --ssh-link \
-    --flags --why-merge --header
+    --collapse-ip-threshold 2 --flags --why-merge --header
 """
 
 import argparse, os, re, ipaddress, socket, subprocess
@@ -284,8 +285,7 @@ def tls_cert_fingerprint_sha256(ip_s: str, port: int, timeout: float = 4.0, sni:
     pem = m.group(0)
     fp = run_cmd(["openssl", "x509", "-noout", "-fingerprint", "-sha256"], timeout=2.0, input_str=pem)
     if not fp: return ""
-    # Format: SHA256 Fingerprint=AA:BB:...
-    parts = fp.strip().split("=")
+    parts = fp.strip().split("=")  # "SHA256 Fingerprint=AA:BB:..."
     return parts[-1].replace(":", "").upper() if parts else ""
 
 def ssh_hostkey_fingerprint_sha256(ip_s: str, port: int = 22, timeout: float = 4.0) -> str:
@@ -326,6 +326,11 @@ def main():
                     help="Merge IPv6 rows into IPv4 rows when correlated by name/DNS/MAC/cert/ssh.")
     ap.add_argument("--flags", action="store_true", help="Include a FLAGS column (needed to view --why-merge tags).")
     ap.add_argument("--why-merge", action="store_true", help="Annotate merge reasons inside FLAGS.")
+    # output shaping for large IP sets
+    ap.add_argument("--collapse-ip-threshold", type=int, default=None,
+                    help="If total IPs (v4+v6) in a merged row exceed N, omit IPs and add COLLAPSED_IPS:v4=#,v6=# to FLAGS.")
+    ap.add_argument("--ip-summary", type=int, default=0,
+                    help="If >0, print at most K IPs per family with ' (+X more)'. Ignored if --collapse-ip-threshold triggers.")
     args = ap.parse_args()
 
     known_domains, known_netbios, _ = parse_domains_and_netbios(args.domain, args.netbios)
@@ -552,10 +557,10 @@ def main():
                 p = p.strip()
                 if p.isdigit(): tls_ports.append(int(p))
         if tls_ports:
+            from typing import Tuple
             fp_map_v4: Dict[Tuple[int,str], List[int]] = defaultdict(list)
             fp_map_v6: Dict[Tuple[int,str], List[int]] = defaultdict(list)
 
-            # Helper to choose an SNI (FQDN if available; else synth from short+domain)
             def pick_sni(row: dict) -> str:
                 if not args.tls_sni:
                     return ""
@@ -569,7 +574,6 @@ def main():
                 if fqdn:
                     return fqdn
                 if short and known_domains:
-                    # deterministic pick of a domain
                     d = sorted(known_domains)[0]
                     return f"{short}.{d}"
                 return ""
@@ -604,7 +608,7 @@ def main():
         # Union initial edges
         for a,b,reason in edges:
             union(a,b)
-            if args.why-merge:
+            if args.why_merge:
                 rows[a]["flags"].add("MERGED_BY_"+reason)
                 rows[b]["flags"].add("MERGED_BY_"+reason)
 
@@ -638,7 +642,7 @@ def main():
                         j = index_by_ip.get(v6)
                         if j is not None and rows[j]["v"] == 6:
                             union(v4_idxs[0], j)
-                            if args.why-merge:
+                            if args.why_merge:
                                 rows[v4_idxs[0]]["flags"].add("MERGED_BY_AAAA")
                                 rows[j]["flags"].add("MERGED_BY_AAAA")
                                 if nm not in (rows[v4_idxs[0]]["resolved"], rows[v4_idxs[0]]["log_name"]):
@@ -668,7 +672,7 @@ def main():
                         j = index_by_ip.get(v4)
                         if j is not None and rows[j]["v"] == 4:
                             union(v6_idxs[0], j)
-                            if args.why-merge:
+                            if args.why_merge:
                                 rows[v6_idxs[0]]["flags"].add("MERGED_BY_A")
                                 rows[j]["flags"].add("MERGED_BY_A")
                                 if nm not in (rows[v6_idxs[0]]["resolved"], rows[v6_idxs[0]]["log_name"]):
@@ -721,7 +725,7 @@ def main():
                     any_v6 = next(iter(v6_idxs))
                     rep_v4 = next(iter([i for i in comps[target] if rows[i]["v"] == 4]))
                     union(any_v6, rep_v4)
-                    if args.why-merge:
+                    if args.why_merge:
                         rows[any_v6]["flags"].add("MERGED_BY_FQDN" if cand_fqdns else "MERGED_BY_SHORT")
 
         # Build final components and output
@@ -737,6 +741,23 @@ def main():
             if m and m.group(1) in plain_bases:
                 return m.group(1)
             return name
+
+        def render_ips(v4_list: List[str], v6_list: List[str], flags_set: Set[str]) -> Tuple[str,str]:
+            total = len(v4_list) + len(v6_list)
+            # Collapse wins over summary
+            if args.collapse_ip_threshold is not None and total > args.collapse_ip_threshold:
+                flags_set.add(f"COLLAPSED_IPS:v4={len(v4_list)},v6={len(v6_list)}")
+                return ("", "")
+            if args.ip_summary and args.ip_summary > 0:
+                def fmt(lst):
+                    if len(lst) <= args.ip_summary:
+                        return ";".join(lst)
+                    shown = ";".join(lst[:args.ip_summary])
+                    rest = len(lst) - args.ip_summary
+                    return f"{shown} (+{rest} more)"
+                return (fmt(v4_list), fmt(v6_list))
+            # default: full lists
+            return (";".join(v4_list), ";".join(v6_list))
 
         merged_rows = []
         consumed = set()
@@ -763,9 +784,10 @@ def main():
                 if new_log != log_pick:
                     flags.add("LOGNAME_DENUMBERED")
                     log_pick = new_log
+                ipv4_str, ipv6_str = render_ips(ipv4_addrs, ipv6_addrs, flags)
                 merged_rows.append({
-                    "ipv4": ";".join(ipv4_addrs),
-                    "ipv6": ";".join(ipv6_addrs),
+                    "ipv4": ipv4_str,
+                    "ipv6": ipv6_str,
                     "log_name": log_pick,
                     "resolved": resolved_pick,
                     "protos": "|".join(sorted(protos)) if protos else "UNKNOWN",
@@ -781,13 +803,17 @@ def main():
             if m and m.group(1) in plain_bases:
                 new_log = m.group(1)
                 r["flags"].add("LOGNAME_DENUMBERED")
+            v4_list = [r["ip"]] if r["v"] == 4 else []
+            v6_list = [r["ip"]] if r["v"] == 6 else []
+            flags = set(r["flags"])
+            ipv4_str, ipv6_str = render_ips(v4_list, v6_list, flags)
             merged_rows.append({
-                "ipv4": r["ip"] if r["v"] == 4 else "",
-                "ipv6": r["ip"] if r["v"] == 6 else "",
+                "ipv4": ipv4_str,
+                "ipv6": ipv6_str,
                 "log_name": new_log,
                 "resolved": r["resolved"],
                 "protos": "|".join(sorted(r["protos"])) if r["protos"] else "UNKNOWN",
-                "flags": "|".join(sorted(r["flags"])) if r["flags"] else ""
+                "flags": "|".join(sorted(flags)) if flags else ""
             })
 
         merged_rows.sort(key=merged_row_sort_key)
